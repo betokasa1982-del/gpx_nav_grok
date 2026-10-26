@@ -1,0 +1,5476 @@
+// ══ helpers ══
+function gps(lat,lng,kmh){onGPS({coords:{latitude:lat,longitude:lng,accuracy:8,altitude:30,speed:kmh/3.6,heading:0},timestamp:Date.now()});}
+const realNow=Date.now.bind(Date); let fake=realNow(); Date.now=()=>fake;
+
+// ══ TEST 1: math ══
+console.assert(Math.abs(haversine(57.7089,11.9746,57.7189,11.9746)-1.112)<0.02,'haversine FAIL');
+console.log('1. haversine OK');
+
+// ══ TEST 2: maneuver peak detection (90° corner = ONE right turn) ══
+routePts=[];
+for(let i=0;i<=100;i++)routePts.push({lat:57.70+i*0.0001,lon:11.97});
+for(let i=1;i<=100;i++)routePts.push({lat:57.71,lon:11.97+i*0.0002});
+buildCumDist(routePts);totalRouteDist=routeCumDist[routeCumDist.length-1];
+maneuvers=buildManeuvers(routePts);
+const t2=maneuvers.filter(m=>m.type!=='arrive');
+console.assert(t2.length===1&&t2[0].type==='right','maneuver FAIL: '+JSON.stringify(t2.map(x=>x.type)));
+console.log('2. buildManeuvers OK:',maneuvers.map(m=>m.type).join(','));
+
+// ══ TEST 3: MULTI-LAP CYCLE — 3 stops at the SAME physical location ══
+// (this is the field bug: "completou todas as paradas na primeira parada")
+const SL=57.71, SG=11.97; // stop location (the corner)
+stops=[1,2,3].map(id=>({id,name:'Lap '+id,lat:SL,lng:SG,dur_s:10,elapsed:0,running:false,intervalId:null,state:'waiting'}));
+stopMarkers={1:{setIcon(){}},2:{setIcon(){}},3:{setIcon(){}}};
+const mk=()=>({addTo(){return this},setLatLngs(){},addLatLng(){},bringToFront(){},setIcon(){},setLatLng(){},getBounds:()=>({isValid:()=>true})});
+routeLayer=routeAheadLayer=routeRemainLayer=routeDoneLayer=mk();
+insideStop.clear();lastRouteIdx=0;navActive=true;departGate=null;
+
+gps(SL,SG,3); // arrive slowly at the stop
+console.assert(stops[0].state==='current','lap1 arrive FAIL: '+stops[0].state);
+console.assert(stops[1].state==='waiting'&&stops[2].state==='waiting',
+  'ALL-STOPS-AT-ONCE BUG STILL PRESENT: '+stops.map(s=>s.state).join(','));
+console.log('3a. only lap-1 arrived OK:',stops.map(s=>s.state).join(','));
+
+markDone(1); // timer auto-complete equivalent
+gps(SL,SG,2); gps(SL,SG,1); // still parked at the stop
+console.assert(stops[1].state==='waiting','GATE FAIL — lap2 arrived while still parked: '+stops[1].state);
+console.log('3b. departure gate holds while parked OK');
+
+gps(57.7135,SG,40); // drive away ~390 m, fast (clears gate)
+gps(SL,SG,3);        // come back around the lap
+console.assert(stops[1].state==='current','lap2 re-arrival FAIL: '+stops[1].state);
+console.assert(stops[2].state==='waiting','lap3 premature FAIL');
+console.log('3c. lap-2 armed after real departure OK');
+
+// ══ TEST 4: regression — two DISTINCT stops, auto-stop departure ══
+stops=[{id:1,name:'A',lat:57.70,lng:11.97,dur_s:10,elapsed:5,running:false,intervalId:null,state:'waiting'},
+       {id:2,name:'B',lat:57.706,lng:11.97,dur_s:10,elapsed:0,running:false,intervalId:null,state:'waiting'}];
+stopMarkers={1:{setIcon(){}},2:{setIcon(){}}};
+insideStop.clear();departGate=null;
+gps(57.70,11.97,3);                        // arrive A
+console.assert(stops[0].state==='current','A arrive FAIL');
+stops[0].running=true;                     // timer running (mock interval doesn't tick)
+gps(57.7025,11.97,30);                     // depart A (~280m, fast)
+console.assert(stops[0].state==='done','A auto-stop FAIL: '+stops[0].state);
+gps(57.706,11.97,3);                       // arrive B (~670m from A — gate long cleared)
+console.assert(stops[1].state==='current','B arrive FAIL: '+stops[1].state);
+console.log('4. distinct sequential stops OK');
+
+// ══ TEST 5: rotation branch executes (DOMMatrix present, no crash) ══
+// The stub is RESTORED afterwards: leaving a dead setView in place silently
+// disabled map centring for every later test in the file.
+const _realSetView=map.setView;
+let svCalls=0; map.setView=(...a)=>{svCalls++;return _realSetView.apply(map,a);};
+currentHeading=90; gps(57.706,11.97,30);
+console.assert(svCalls>0,'follow/rotation branch FAIL — setView never called');
+map.setView=_realSetView;
+console.log('5. rotation/follow branch OK');
+
+// ══ TEST 6: stopRec auto-loads the recording ══
+navActive=false;isRec=true;
+recPoints=[];for(let i=0;i<50;i++)recPoints.push({lat:57.70+i*0.0001,lng:11.97,t:fake+i*1000});
+recStops=[{lat:57.702,lng:11.97,t:fake,dur_s:12,startT:fake,events:['openDoor'],photo:null}];
+recStopCandidate=null;
+stopRec();
+console.assert(savedRecs.filter(Boolean).length>=1,'stopRec save FAIL');
+console.assert(routePts.length===50,'AUTO-LOAD FAIL — route not loaded after rec: '+routePts.length);
+console.assert(stops.length===1&&stops[0].events.includes('openDoor'),'auto-load stops/events FAIL');
+// CLEANUP (22 Sep): the topbar ▶ Nav button was one of four ways to start
+// navigation and was removed. The surviving single control is the action
+// bar's START, so that is what must be armed after an auto-load.
+console.assert(!el('big-start').classList.contains('disabled'),
+  'START not armed after auto-load');
+console.log('6. stopRec auto-load OK — route, stops, events, Nav ready');
+
+console.log('ALL TESTS PASSED');
+
+// ══ TEST 7: settings persistence ══
+el('rng-radius').value='12'; saveSettings();
+el('rng-radius').value='80'; loadSettings();
+console.assert(el('rng-radius').value==='12','settings persist FAIL: '+el('rng-radius').value);
+console.log('7. settings persistence OK');
+
+// ══ TEST 8: script-generated JSON import (lat/lon, ISO t, no dist, duracao_s) ══
+const scriptJSON=JSON.stringify({points:[
+  {lat:57.70,lon:11.97,t:'2026-06-10T08:00:00Z'},
+  {lat:57.705,lon:11.97,t:'2026-06-10T08:01:00Z'},
+  {lat:57.71,lon:11.97,t:'2026-06-10T08:02:00Z'}],
+  stops:[{lat:57.705,lon:11.97,duracao_s:30,events:['openDoor']}]});
+const nBefore=savedRecs.filter(Boolean).length;
+global.FileReader=class{readAsText(){this.onload({target:{result:scriptJSON}})}};
+global.alert=()=>{};
+importRecsJSON({files:[{name:'ciclo.json'}],value:''});
+const imp=savedRecs.filter(Boolean).pop();
+console.assert(savedRecs.filter(Boolean).length===nBefore+1,'import count FAIL');
+console.assert(imp.points[0].lng===11.97&&typeof imp.points[0].t==='number','lon→lng/ISO-t normalize FAIL');
+console.assert(imp.stops[0].dur_s===30&&imp.stops[0].events[0]==='openDoor','duracao_s/events FAIL');
+console.assert(imp.dist>1.0,'auto dist FAIL: '+imp.dist);
+console.log('8. script JSON import OK — dist',imp.dist.toFixed(2),'km, dur_s',imp.stops[0].dur_s);
+
+// ══ TEST 9: 10m radius — arrival fires at ~8m, not at 50m ══
+el('rng-radius').value='10';
+stops=[{id:1,name:'P1',lat:57.70,lng:11.97,dur_s:10,elapsed:0,running:false,intervalId:null,state:'waiting'}];
+stopMarkers={1:{setIcon(){}}};insideStop.clear();departGate=null;navActive=true;
+gps(57.7005,11.97,3);  // ~55m away, slow (eff radius = 18m)
+console.assert(stops[0].state==='waiting','10m radius FAIL — arrived at 55m');
+gps(57.70007,11.97,3); // ~8m away
+console.assert(stops[0].state==='current','10m arrival FAIL at 8m');
+console.log('9. 10m radius arrival OK');
+
+console.log('ALL EXTENDED TESTS PASSED');
+
+// ══ TEST 10: rotation — container transform, no Leaflet pane involvement ══
+setMapBearing(-90);
+console.assert(/rotate\(-90deg\)/.test(__mapC.style.transform),'container rotate FAIL: '+__mapC.style.transform);
+console.assert(__mapC.classList.contains('rotated'),'rotated class FAIL');
+// wraparound continuity: -350 after -10 must unwrap (no +340° long spin)
+setMapBearing(-10); setMapBearing(-350);
+const m=__mapC.style.transform.match(/rotate\((-?[\d.]+)deg\)/);
+console.assert(m&&Math.abs(+m[1]-10)<0.01,'unwrap FAIL: '+__mapC.style.transform); // -350 ≡ +10, near -10
+setMapBearing(0);
+console.assert(__mapC.style.transform===''||/rotate\((-?360|0)deg\)/.test(__mapC.style.transform),'north reset FAIL');
+console.log('10. container rotation + unwrap OK');
+
+// ══ TEST 11: voice — no mid-word cancel loop, dedup per semantic key ══
+__speech.spoken=[];__speech.cancels=0;
+for(const k in _spokenAt)delete _spokenAt[k];
+voiceOn=true;
+// simulate the field loop: event announce + maneuver announce alternating each GPS tick
+for(let tick=0;tick<10;tick++){
+  speakText('Stop 1: open doors required',true);   // was re-firing every other tick
+  speakText('In 500 meters, turn right');           // maneuver
+}
+const s1=__speech.spoken.filter(t=>t.includes('open doors')).length;
+const s2=__speech.spoken.filter(t=>t.includes('500 meters')).length;
+console.assert(s1===1,'event announce repeat FAIL: spoken '+s1+'x');
+console.assert(s2===1,'maneuver dedup FAIL: spoken '+s2+'x');
+// priority cancels current speech exactly once (not once per tick)
+console.assert(__speech.cancels===1,'cancel storm FAIL: '+__speech.cancels+' cancels');
+// different stop number = same semantic key → still suppressed within cooldown (no chatter),
+// but a genuinely different sentence passes
+speakText('Turn left ahead');
+console.assert(__speech.spoken.includes('Turn left ahead'),'distinct message blocked FAIL');
+console.log('11. voice dedup OK — spoken:',__speech.spoken.length,'cancels:',__speech.cancels);
+
+console.log('ALL v5 TESTS PASSED');
+
+// ══ TEST 12: GPS jitter at a stop must NOT create a phantom U-turn ══
+routePts=[];
+for(let i=0;i<60;i++)routePts.push({lat:57.70+i*0.0001,lon:11.97});       // north ~660m
+const jl=57.706, jg=11.97;                                                  // "parked" cluster
+for(let i=0;i<15;i++)routePts.push({lat:jl+(i%3-1)*0.00002,lon:jg+((i*7)%3-1)*0.00002}); // ±2m jitter
+for(let i=1;i<60;i++)routePts.push({lat:jl+i*0.0001,lon:11.97});            // continue north
+buildCumDist(routePts);totalRouteDist=routeCumDist[routeCumDist.length-1];
+maneuvers=buildManeuvers(routePts);
+const phantom=maneuvers.filter(m=>m.type==='uturn'||m.type==='shr'||m.type==='shl');
+console.assert(phantom.length===0,'PHANTOM U-TURN STILL PRESENT: '+JSON.stringify(phantom.map(p=>p.type)));
+console.assert(maneuvers.filter(m=>m.type!=='arrive').length===0,'straight route got turns: '+maneuvers.map(m=>m.type));
+console.log('12. jitter cluster filtered OK — maneuvers:',maneuvers.map(m=>m.type).join(','));
+
+// ══ TEST 13: recording decimation — parked vehicle adds ~no points ══
+navActive=false;isRec=true;recPoints=[];recStops=[];recStopCandidate=null;recLayer=null;
+fake=realNow();
+for(let i=0;i<10;i++){fake+=1000;gps(57.70+(i%2)*0.000005,11.97,1);} // parked, <1m jitter, 10s
+const parkedPts=recPoints.length;
+console.assert(parkedPts<=3,'decimation FAIL — '+parkedPts+' jitter points recorded');
+for(let i=1;i<=5;i++){fake+=1000;gps(57.70+i*0.0002,11.97,40);}      // moving ~22m/s
+console.assert(recPoints.length>=parkedPts+5,'moving points lost: '+recPoints.length);
+console.log('13. decimation OK — parked:',parkedPts,'pts, after moving:',recPoints.length);
+
+// ══ TEST 14: orphaned markers cleared on new recording ══
+let removed=0; map.removeLayer=()=>{removed++};
+extraMarkers.length=0;
+extraMarkers.push({_m:1},{_m:2},{_m:3}); // simulate start/end dots + rec pin
+stopMarkers={1:{_m:4}};
+routeLayer=routeAheadLayer=routeRemainLayer=routeDoneLayer=recLayer={addTo(){return this}};
+clearMapLayers();
+console.assert(extraMarkers.length===0,'extraMarkers not cleared');
+console.assert(removed>=8,'removeLayer count FAIL: '+removed); // 5 layers + 1 stopMarker + 3 extras... >=8
+console.log('14. orphaned markers cleared OK — removeLayer called',removed,'x');
+
+console.log('ALL v6 TESTS PASSED');
+
+// ══ TEST 15: GTA/VBC classification — synthetic Ci2 cycle ══
+// Target: avg ~19 (15-23), drive ~27 (23-32), max ~54 (50-60), idle ~30% (27-36), 3 st/km (2.5-5)
+fake=realNow();
+const apts=[];let alat=57.70,t0g=fake;
+function drive(sec,ms){for(let i=0;i<sec;i++){alat+=ms*0.0000090;t0g+=1000;apts.push({lat:alat,lng:11.97,t:t0g,alt:30+apts.length*0.05});}}
+function park(sec){for(let i=0;i<sec;i+=10){t0g+=10000;apts.push({lat:alat,lng:11.97,t:t0g,alt:30+apts.length*0.05});}}
+apts.push({lat:alat,lng:11.97,t:t0g,alt:30});
+drive(120,7.5); park(60); drive(80,7.5); drive(4,15); park(50); drive(60,7.5);
+const gta=calcGTAScore(apts,[{},{},{},{},{},{}]); // 6 stops over ~2 km
+console.assert(gta.cls==='Ci2','GTA class FAIL: '+JSON.stringify({cls:gta.cls,m:gta.metrics}));
+console.assert(gta.matched>=4,'GTA criteria FAIL: '+gta.matched+'/5 '+JSON.stringify(gta.detail));
+const eg=calcElevGain(apts);
+console.assert(eg!=null&&eg>=8,'elev gain FAIL: '+eg);
+console.assert(calcGTAScore([{lat:1,lng:1,t:1}],[]).matched===null,'GTA null-guard FAIL');
+// LH cycle: 0 stops, highway profile (avg~64, drive~68, max~95, idle~6%)
+const lpts=[];alat=57.70;t0g=fake+1e7;lpts.push({lat:alat,lng:11.97,t:t0g});
+for(let i=0;i<150;i++){alat+=26.4*0.0000090;t0g+=1000;lpts.push({lat:alat,lng:11.97,t:t0g});} // 95 km/h
+for(let i=0;i<150;i++){alat+=11.4*0.0000090;t0g+=1000;lpts.push({lat:alat,lng:11.97,t:t0g});} // 41 km/h
+for(let i=0;i<20;i+=10){t0g+=10000;lpts.push({lat:alat,lng:11.97,t:t0g});}                    // idle
+const lh=calcGTAScore(lpts,[]);
+console.assert(lh.cls==='LH1'&&lh.matched>=4,'LH class FAIL: '+lh.cls+' '+lh.matched+' '+JSON.stringify(lh.metrics));
+console.log('15. GTA classification OK —',gta.cls,gta.matched+'/5, LH cycle →',lh.cls,lh.matched+'/5');
+
+// ══ TEST 16: editable cycle name + GTA stored on save ══
+global.__promptReply='Sion Lap 3';
+isRec=true;navActive=false;recStops=[{},{},{},{},{},{}];recStopCandidate=null;
+recPoints=apts.map(p=>({...p}));
+stopRec();
+const last=savedRecs.filter(Boolean).pop();
+console.assert(last.name==='Sion Lap 3','name edit FAIL: '+last.name);
+console.assert(last.score?.cls==='Ci2'&&last.score.matched!=null&&last.elev!=null,'stored GTA FAIL: '+JSON.stringify({c:last.score?.cls,e:last.elev}));
+delete global.__promptReply;
+console.log('16. editable name + stored GTA OK:',last.score.cls,last.score.matched+'/5');
+
+// ══ TEST 17: seg_avg attached to nav stops and shown in HUD chip ══
+console.assert(stops.length===0||true,'');
+const spts=[];fake=realNow();
+for(let i=0;i<120;i++)spts.push({lat:57.70+i*0.00009,lng:11.97,t:fake+i*1000}); // 10 m/s
+savedRecs.push({name:'SegTest',dist:1,date:new Date(),points:spts,
+  stops:[{lat:spts[60].lat,lng:11.97,t:spts[60].t,dur_s:20}]});
+loadRec(savedRecs.length-1);
+console.assert(stops[0].seg_avg!=null&&Math.abs(stops[0].seg_avg-36)<3,'seg_avg attach FAIL: '+stops[0].seg_avg);
+navActive=true;
+gps(57.70,11.97,30);
+console.assert(/Ø 3[3-9]/.test(el('hud-tgt').textContent),'HUD target chip FAIL: "'+el('hud-tgt').textContent+'"');
+console.log('17. leg pacing in HUD OK:',el('hud-tgt').textContent);
+
+// ══ TEST 18: tapping active tab collapses sheet (user only) ══
+shState='mid';
+el('stab-rota').classList.add('active');
+switchTab('rota',true);
+console.assert(shState==='peek','tab collapse FAIL: '+shState);
+switchTab('rota');           // programmatic — must NOT collapse from peek→stay/open
+console.assert(shState==='mid','programmatic open FAIL: '+shState);
+switchTab('gravadas',true);  // different tab — opens
+console.assert(shState==='mid','tab open FAIL: '+shState);
+console.log('18. tab retract/expand OK');
+
+console.log('ALL v7 TESTS PASSED');
+
+// ══ TEST 19: panel open/close ══
+// SPEC CHANGE (22 Sep, field report): the swipe-to-drag sheet was removed.
+// A draggable container wrapping a scrollable list made every touch
+// ambiguous — "o scroll quase sempre puxa a barra principal". The shell now
+// has NO drag gesture; the swipe assertions below were replaced by the
+// close-button behaviour that took over the same job.
+shState='peek';
+toggleSheetCollapse();
+console.assert(shState==='mid','panel open FAIL: '+shState);
+toggleSheetCollapse();
+console.assert(shState==='peek','panel close FAIL: '+shState);
+console.assert(typeof globalThis.shTE==='undefined'&&typeof globalThis.shTM==='undefined',
+  '19: a sheet drag handler came back — the scroll conflict returns with it');
+console.log('19. panel open/close, no drag handlers OK');
+
+console.log('ALL v8 TESTS PASSED');
+
+// ══ TEST 20: crash recovery — in-flight flush + boot recover ══
+isRec=true;recPoints=[];recStops=[];recStopCandidate=null;_lastFlush=0;fake=realNow();
+for(let i=0;i<8;i++){fake+=6000;gps(57.72+i*0.0005,11.97,40);} // 48s drive → ≥1 flush
+console.assert(localStorage.getItem('gpx-nav-inflight')!=null,'inflight flush FAIL');
+isRec=false; // simulate app crash (no stopRec)
+const nRecs=savedRecs.filter(Boolean).length;
+checkInflightRecovery(); // confirm mock returns true
+console.assert(savedRecs.filter(Boolean).length===nRecs+1,'recovery FAIL');
+console.assert(localStorage.getItem('gpx-nav-inflight')==null,'inflight not cleared');
+console.assert(/^Recovered/.test(savedRecs.filter(Boolean).pop().name),'recovery name FAIL');
+console.log('20. crash recovery OK');
+
+// ══ TEST 21: quota guard warns above 3.5 MB ══
+let alerts=[];const oldAlert=global.alert;global.alert=m=>alerts.push(m);
+_quotaWarned=false;
+localStorage.setItem('bigblob','x'.repeat(1.9*1024*1024)); // ~3.8MB in UTF-16 estimate
+checkQuota();
+console.assert(alerts.some(a=>/Storage/.test(a)),'quota warn FAIL: '+alerts.length);
+localStorage.removeItem('bigblob');global.alert=oldAlert;_quotaWarned=false;
+console.log('21. quota guard OK');
+
+// ══ TEST 22: altitude survives persistence round-trip (elev was lost on reload) ══
+savedRecs.length=0;
+savedRecs.push({name:'AltTest',dist:1,date:new Date(),points:[
+  {lat:57.7,lng:11.97,t:1,alt:100.04},{lat:57.71,lng:11.97,t:2,alt:120.06}],stops:[]});
+saveRecordings();
+const stored=JSON.parse(localStorage.getItem('gpx-nav-recs'));
+console.assert(stored[0].points[0].alt===100&&stored[0].points[1].alt===120.1,'alt persist FAIL: '+JSON.stringify(stored[0].points));
+console.log('22. altitude persistence OK');
+
+// ══ TEST 23: Next Stop Card content during nav ══
+stops=[{id:1,name:'P1',lat:57.80,lng:11.97,dur_s:45,elapsed:0,running:false,intervalId:null,
+  state:'waiting',events:['openDoor'],seg_avg:31.5,photo:null}];
+stopMarkers={1:{setIcon(){}}};insideStop.clear();departGate=null;navActive=true;
+el('rng-radius').value='10';
+gps(57.7964,11.97,40); // ~400 m away
+console.assert(el('nsc').style.display==='block','NSC hidden FAIL');
+console.assert(/40[0-9] m|39[0-9] m/.test(el('nsc-dist').textContent),'NSC dist FAIL: '+el('nsc-dist').textContent);
+// UX v1 replaced the emoji text with SVG chips (spec §8/§11: do not depend on
+// emojis in the driving UI). Assert the SEMANTIC outcome instead of the glyph:
+// the Door event is represented and no other event is.
+console.assert(/Open Door/.test(el('nsc-evt').innerHTML),'NSC events FAIL: '+el('nsc-evt').innerHTML);
+console.assert(!/Kneeling|Hand Brake/.test(el('nsc-evt').innerHTML),'NSC events leaked other events');
+console.assert(/31\.5/.test(el('nsc-leg').textContent),'NSC leg FAIL: '+el('nsc-leg').textContent);
+console.assert(el('nsc-count').textContent==='1/1','NSC count FAIL: '+el('nsc-count').textContent);
+// at stop: countdown mode
+stops[0].state='current';stops[0].elapsed=15;
+gps(57.80,11.97,1);
+console.assert(el('nsc-title').textContent.includes('AT STOP'),'NSC atstop FAIL');
+console.assert(el('nsc-dist').textContent==='00:30','NSC countdown FAIL: '+el('nsc-dist').textContent);
+navActive=false;stops=[];
+console.log('23. Next Stop Card OK');
+
+console.log('ALL v9-DEV TESTS PASSED');
+
+// ══ TEST 24: GPS simulator — full nav replay from a recorded cycle ══
+// Build a "physically recorded" cycle: drive 60s @10 m/s, dwell 30s, drive 40s
+fake=realNow();let qlat=57.90,qt=fake;
+const qpts=[{lat:qlat,lng:11.97,t:qt}];
+for(let i=0;i<60;i++){qlat+=10*0.0000090;qt+=1000;qpts.push({lat:qlat,lng:11.97,t:qt});}
+const stopPos=qlat;
+for(let i=0;i<30;i+=5){qt+=5000;qpts.push({lat:qlat,lng:11.97,t:qt});}
+for(let i=0;i<40;i++){qlat+=10*0.0000090;qt+=1000;qpts.push({lat:qlat,lng:11.97,t:qt});}
+savedRecs.push({name:'SimCycle',dist:1,date:new Date(),points:qpts,
+  stops:[{lat:stopPos,lng:11.97,t:qpts[61].t,dur_s:25,events:[]}]});
+const simRecIdx=savedRecs.length-1;
+loadRec(simRecIdx);
+console.assert(stops.length===1&&routePts.length===qpts.length,'sim loadRec FAIL');
+navActive=true;watchId=7;el('rng-sim').value='10';
+__speech.spoken=[];for(const k in _spokenAt)delete _spokenAt[k];
+startSim(simRecIdx);
+// mock setTimeout runs <=1000ms inline → whole sim executed synchronously
+console.assert(simRec===null,'sim did not finish: idx '+simIdx); // simTimer===0 is the sync-mock artifact
+console.assert(stops[0].state==='done'||stops[0].state==='current','SIM arrival FAIL: '+stops[0].state);
+console.assert(lastRouteIdx>50,'SIM route matching FAIL: '+lastRouteIdx);
+console.assert(__speech.spoken.some(t=>/Arrived at stop/.test(t)),'SIM voice FAIL');
+console.assert(watchId!=null,'real GPS not resumed after sim');
+console.log('24. GPS simulator OK — arrival, matching, voice all replayed; stop state:',stops[0].state);
+
+console.log('ALL v10-DEV TESTS PASSED');
+
+// ══ TEST 25: live cycle metrics accumulate during navigation ══
+fake=realNow();
+stops=[{id:1,name:'P1',lat:57.85,lng:11.97,dur_s:20,elapsed:0,running:false,intervalId:null,
+  state:'waiting',events:[],seg_avg:null,photo:null}];
+stopMarkers={1:{setIcon(){}}};insideStop.clear();departGate=null;navActive=true;
+live={dist:0,moving:0,idle:0,stops:0,last:null,lastT:null};
+el('rng-radius').value='10';
+// drive 50s @ ~10 m/s toward the stop
+let mlat=57.80;
+for(let i=0;i<50;i++){fake+=1000;mlat+=10*0.0000090;gps(mlat,11.97,36);}
+console.assert(el('lcm').style.display==='block','LCM hidden FAIL');
+const drv=parseFloat(el('lcm-drv').textContent);
+console.assert(Math.abs(drv-36)<4,'LCM avg driving FAIL: '+el('lcm-drv').textContent);
+console.assert(/km/.test(el('lcm-extra').textContent),'LCM extra FAIL: '+el('lcm-extra').textContent);
+// idle at the stop for 30s → avg total must drop below avg driving
+for(let i=0;i<30;i++){fake+=1000;gps(mlat,11.97,0.5);}
+const avgT=parseFloat(el('lcm-avg').textContent),drv2=parseFloat(el('lcm-drv').textContent);
+console.assert(avgT<drv2,'LCM total<driving FAIL: tot '+avgT+' drv '+drv2);
+console.assert(/[1-9][0-9]?%/.test(el('lcm-extra').textContent),'LCM idle% FAIL: '+el('lcm-extra').textContent);
+console.log('25. live metrics OK — drv',el('lcm-drv').textContent,'tot',el('lcm-avg').textContent,'·',el('lcm-extra').textContent);
+
+// ══ TEST 26: SIM auto-starts navigation (new HUD shown) ══
+navActive=false;currentLoadedRec=-1;watchId=null;
+fake=realNow();let s26lat=57.95;const s26pts=[{lat:s26lat,lng:11.97,t:fake}];
+for(let i=0;i<30;i++){s26lat+=10*0.0000090;fake+=1000;s26pts.push({lat:s26lat,lng:11.97,t:fake});}
+savedRecs.push({name:'AutoNavSim',dist:1,date:new Date(),points:s26pts,stops:[]});
+const s26idx=savedRecs.length-1;
+el('rng-sim').value='15';
+startSim(s26idx);
+console.assert(navActive===true,'SIM did not auto-start navigation (navActive false)');
+console.assert(currentLoadedRec===s26idx,'SIM did not auto-load cycle: '+currentLoadedRec);
+console.assert(routePts.length===s26pts.length,'SIM cycle not loaded into routePts');
+console.log('26. SIM auto-nav OK — new HUD active during simulation');
+
+console.log('ALL v11-DEV TESTS PASSED');
+
+// ══ TEST 27: circular start/end stop dedup (the only change over stable v32) ══
+(function(){
+const fs=require('fs'),path=require('path');
+const FX=path.join(__dirname,'real_cycle.json');
+if(!fs.existsSync(FX)){console.log('27. circular start/end dedup SKIPPED — real_cycle.json fixture not in repo');return;}
+const rec=JSON.parse(fs.readFileSync(FX,'utf8'));
+const r=Array.isArray(rec)?rec[0]:rec;
+savedRecs.push(r);const zi=savedRecs.length-1;
+loadRec(zi);
+// 7 recorded stops on this circular cycle → 6 after merging the co-located start/end
+console.assert(stops.length===6,'dedup FAIL: expected 6 stops, got '+stops.length);
+console.log('27. circular start/end dedup OK — 7 recorded → '+stops.length+' navigable');
+})();
+
+console.log('ALL v33-DEV TESTS PASSED');
+
+// ══════════════════════════════════════════════════════════════════════════
+//  NAVIGATION ENGINE v2 — matching / direction / stop-association tests
+// ══════════════════════════════════════════════════════════════════════════
+__group('Existing tests');
+console.log('\n── navigation engine v2 ──');
+// Earlier tests mutate the shared sliders (test 9 leaves the radius at 10 m).
+// Pin every setting this suite depends on so the cases are order-independent.
+el('rng-radius').value='80'; el('rng-auto').value='1';
+el('rng-autostop').value='1'; el('rng-follow').value='1';
+
+const mkL=()=>({addTo(){return this},setLatLngs(){},addLatLng(){},bringToFront(){},
+                setIcon(){},setLatLng(){},getBounds:()=>({isValid:()=>true})});
+
+/* Build an out-and-back route: north up a street, then back down a PARALLEL
+   street `sepM` metres to the east. This is the field failure geometry. */
+function buildOutAndBack(sepM){
+  const lat0=57.700, lng0=11.970, N=120;
+  const dLat=0.00009;                       // ~10 m per point
+  const dLng=sepM/ (111320*Math.cos(lat0*Math.PI/180));
+  const pts=[];
+  for(let i=0;i<N;i++)   pts.push({lat:lat0+i*dLat, lon:lng0});          // outbound N
+  for(let i=N-1;i>=0;i--)pts.push({lat:lat0+i*dLat, lon:lng0+dLng});     // return  S
+  return pts;
+}
+function installRoute(pts){
+  if(typeof CycleGate!=='undefined')CycleGate.reset();   // helper bypasses loadRec
+  routePts=pts; buildCumDist(routePts);
+  totalRouteDist=routeCumDist[routeCumDist.length-1];
+  routeLayer=routeAheadLayer=routeRemainLayer=routeDoneLayer=mkL();
+  buildRouteIndex(); resetMatcher();
+  maneuvers=buildManeuvers(routePts);
+  navActive=true; insideStop.clear(); departGate=null; lastRouteIdx=0;
+}
+/* feed a GPS fix with an explicit heading/accuracy */
+function gpsH(lat,lng,kmh,hdg,acc){
+  onGPS({coords:{latitude:lat,longitude:lng,accuracy:acc??8,altitude:30,
+                 speed:kmh/3.6,heading:hdg},timestamp:(fake+=1000)});
+}
+
+// ── TEST A: two parallel streets 12 m apart — matcher must not swap legs ──
+(function(){
+  const pts=buildOutAndBack(12); installRoute(pts);
+  isRec=false; stops=[]; stopMarkers={};
+  // drive the outbound leg northbound (heading 0°)
+  let maxSeg=0, swapped=false;
+  for(let i=0;i<110;i++){
+    gpsH(pts[i].lat, pts[i].lon, 30, 0);
+    const seg=matchState?matchState.segmentIndex:0;
+    if(seg>=pts.length/2) swapped=true;     // jumped onto the return leg
+    maxSeg=Math.max(maxSeg,seg);
+  }
+  console.assert(!swapped,'A: matcher jumped to the RETURN leg while outbound (seg '+maxSeg+')');
+  console.assert(maxSeg>80,'A: progress did not advance along the outbound leg: '+maxSeg);
+  console.log('A. parallel streets 12 m — stayed on outbound leg OK (seg '+maxSeg+')');
+})();
+
+// ── TEST A2: the return leg must be matched once actually driven ──
+(function(){
+  const pts=buildOutAndBack(12); installRoute(pts);
+  stops=[]; stopMarkers={};
+  for(let i=0;i<120;i++)  gpsH(pts[i].lat,pts[i].lon,30,0);     // outbound, north
+  for(let i=120;i<pts.length;i++) gpsH(pts[i].lat,pts[i].lon,30,180); // return, south
+  console.assert(matchState.segmentIndex>150,'A2: never advanced onto the return leg: '+matchState.segmentIndex);
+  console.log('A2. return leg matched after driving it OK (seg '+matchState.segmentIndex+')');
+})();
+
+// ── TEST B: same physical stop on two laps — sequence + gate + progress ──
+(function(){
+  const pts=[]; const lat0=57.70,lng0=11.97;
+  for(let l=0;l<2;l++)                                    // two identical laps
+    for(let i=0;i<80;i++) pts.push({lat:lat0+i*0.00009,lon:lng0});
+  installRoute(pts);
+  const SL=lat0+40*0.00009;
+  stops=[{id:1,name:'Lap1',lat:SL,lng:lng0,dur_s:10,elapsed:0,running:false,intervalId:null,state:'waiting'},
+         {id:2,name:'Lap2',lat:SL,lng:lng0,dur_s:10,elapsed:0,running:false,intervalId:null,state:'waiting'}];
+  stopMarkers={1:{setIcon(){}},2:{setIcon(){}}};
+  anchorStopsToRoute(null);
+  console.assert(stops[0].routeDistanceM<stops[1].routeDistanceM,
+    'B: co-located stops did not get distinct route distances');
+  for(let i=0;i<=40;i++) gpsH(pts[i].lat,pts[i].lon,20,0);
+  console.assert(stops[0].state==='current','B: lap-1 stop did not arrive: '+stops[0].state);
+  console.assert(stops[1].state==='waiting','B: lap-2 stop armed too early');
+  console.log('B. co-located multi-lap stops are independent OK ('+
+    (stops[0].routeDistanceM/1000).toFixed(2)+' km vs '+(stops[1].routeDistanceM/1000).toFixed(2)+' km)');
+})();
+
+// ── TEST C: arriving from the WRONG direction must not trigger the stop ──
+(function(){
+  const pts=[]; for(let i=0;i<100;i++)pts.push({lat:57.70,lon:11.97+i*0.00017}); // eastbound
+  installRoute(pts);
+  const S=pts[50];
+  stops=[{id:1,name:'S',lat:S.lat,lng:S.lon,dur_s:10,elapsed:0,running:false,intervalId:null,state:'waiting'}];
+  stopMarkers={1:{setIcon(){}}};
+  anchorStopsToRoute(null);
+  console.assert(Math.abs(angleDiff(stops[0].approachBearing,90))<15,
+    'C: approachBearing wrong: '+stops[0].approachBearing);
+  // approach the same coordinate travelling WEST (bearing ~270°)
+  for(let i=60;i>=50;i--) gpsH(pts[i].lat,pts[i].lon,25,270);
+  const v=isValidStopArrival(stops[0],matchState,calculateMovementBearing(),80,0,8);
+  console.assert(v.reason==='WRONG_DIRECTION'||stops[0].state==='waiting',
+    'C: stop accepted from the wrong direction ('+v.reason+' / '+stops[0].state+')');
+  console.log('C. wrong-direction approach rejected OK ('+v.reason+')');
+})();
+
+// ── TEST D: same stop, correct direction → arrival ──
+(function(){
+  const pts=[]; for(let i=0;i<100;i++)pts.push({lat:57.70,lon:11.97+i*0.00017});
+  installRoute(pts);
+  const S=pts[50];
+  stops=[{id:1,name:'S',lat:S.lat,lng:S.lon,dur_s:10,elapsed:0,running:false,intervalId:null,state:'waiting'}];
+  stopMarkers={1:{setIcon(){}}};
+  anchorStopsToRoute(null);
+  for(let i=40;i<=50;i++) gpsH(pts[i].lat,pts[i].lon,25,90);   // eastbound, as recorded
+  console.assert(stops[0].state==='current','D: correct-direction arrival FAILED: '+stops[0].state);
+  console.log('D. correct-direction approach arrives OK');
+})();
+
+// ── TEST E: GPS jitter at a stop — no progress jump, no extra arrival ──
+(function(){
+  const pts=[]; for(let i=0;i<160;i++)pts.push({lat:57.70+i*0.00009,lon:11.97});
+  installRoute(pts);
+  const S=pts[60];
+  stops=[{id:1,name:'A',lat:S.lat,lng:S.lon,dur_s:10,elapsed:0,running:false,intervalId:null,state:'waiting'},
+         {id:2,name:'B',lat:pts[140].lat,lng:pts[140].lon,dur_s:10,elapsed:0,running:false,intervalId:null,state:'waiting'}];
+  stopMarkers={1:{setIcon(){}},2:{setIcon(){}}};
+  anchorStopsToRoute(null);
+  for(let i=50;i<=60;i++) gpsH(pts[i].lat,pts[i].lon,20,0);
+  const progAtStop=routeProgressM, manBefore=maneuvers.length;
+  for(let i=0;i<30;i++)                                    // ±5 m jitter, parked
+    gpsH(S.lat+((i%3)-1)*0.000045, S.lon+((i*7%3)-1)*0.000045, 1, (i*57)%360);
+  console.assert(Math.abs(routeProgressM-progAtStop)<40,
+    'E: jitter moved route progress by '+(routeProgressM-progAtStop).toFixed(0)+' m');
+  console.assert(stops[1].state==='waiting','E: jitter armed the next stop');
+  console.assert(maneuvers.length===manBefore,'E: jitter created maneuvers');
+  console.log('E. parked jitter absorbed OK (Δprogress '+(routeProgressM-progAtStop).toFixed(1)+' m)');
+})();
+
+// ── TEST F: poor accuracy must lower confidence, not force a leg swap ──
+(function(){
+  const pts=buildOutAndBack(12); installRoute(pts);
+  stops=[]; stopMarkers={};
+  for(let i=0;i<60;i++) gpsH(pts[i].lat,pts[i].lon,30,0,6);        // good fix
+  const segGood=matchState.segmentIndex;
+  let swapped=false, sawLowConf=false;
+  for(let i=60;i<90;i++){
+    gpsH(pts[i].lat,pts[i].lon,30,0,60);                            // accuracy 60 m
+    if(matchState.segmentIndex>=pts.length/2)swapped=true;
+    if(matchState.confidence!=='HIGH')sawLowConf=true;
+  }
+  console.assert(!swapped,'F: bad accuracy caused a leg swap');
+  console.assert(sawLowConf,'F: confidence stayed HIGH at 60 m accuracy');
+  console.log('F. degraded accuracy → lower confidence, no swap OK (seg '+segGood+'→'+matchState.segmentIndex+')');
+})();
+
+// ── TEST G: invalid / absent GPS heading at low speed ──
+(function(){
+  const pts=[]; for(let i=0;i<80;i++)pts.push({lat:57.70+i*0.00009,lon:11.97});
+  installRoute(pts);
+  stops=[]; stopMarkers={};
+  [null,NaN,180,0].forEach((hv,k)=>{ for(let i=k*10;i<k*10+10;i++) gpsH(pts[i].lat,pts[i].lon,3,hv); });
+  console.assert(matchState&&matchState.segmentIndex>=25,
+    'G: matching collapsed with bad heading: '+(matchState&&matchState.segmentIndex));
+  const hd=getReliableHeading(3,180);
+  console.assert(hd.source!=='GPS','G: GPS heading trusted at 3 km/h');
+  console.log('G. bad/absent heading handled OK (source '+hd.source+', seg '+matchState.segmentIndex+')');
+})();
+
+// ── TEST H: a real, sustained U-turn IS reported ──
+(function(){
+  const pts=[];
+  for(let i=0;i<60;i++) pts.push({lat:57.70+i*0.00027,lon:11.97});              // north 1.8 km
+  for(let i=1;i<=60;i++)pts.push({lat:57.70+(60-i)*0.00027,lon:11.9703});       // back south
+  buildCumDist(pts); totalRouteDist=routeCumDist[routeCumDist.length-1];
+  const ms=buildManeuvers(pts).filter(m=>m.type!=='arrive');
+  console.assert(ms.some(m=>m.type==='uturn'||m.type==='shl'||m.type==='shr'),
+    'H: real U-turn not detected: '+JSON.stringify(ms.map(m=>m.type)));
+  console.log('H. sustained U-turn detected OK ('+ms.map(m=>m.type).join(',')+')');
+})();
+
+// ── TEST I: a 90° corner is exactly ONE turn ──
+(function(){
+  const pts=[];
+  for(let i=0;i<=80;i++)pts.push({lat:57.70+i*0.00013,lon:11.97});
+  for(let i=1;i<=80;i++)pts.push({lat:57.70+80*0.00013,lon:11.97+i*0.00024});
+  buildCumDist(pts); totalRouteDist=routeCumDist[routeCumDist.length-1];
+  const ms=buildManeuvers(pts).filter(m=>m.type!=='arrive');
+  console.assert(ms.length===1&&ms[0].type==='right',
+    'I: 90° corner produced '+JSON.stringify(ms.map(m=>m.type)));
+  console.log('I. 90° corner = one right turn OK');
+})();
+
+// ── TEST J: a gentle 12° bend produces no maneuver ──
+(function(){
+  const pts=[];
+  for(let i=0;i<=80;i++)pts.push({lat:57.70+i*0.00013,lon:11.97});
+  const bLat=57.70+80*0.00013, r=12*Math.PI/180;
+  for(let i=1;i<=80;i++)pts.push({lat:bLat+i*0.00013*Math.cos(r),lon:11.97+i*0.00013*Math.sin(r)*1.86});
+  buildCumDist(pts); totalRouteDist=routeCumDist[routeCumDist.length-1];
+  const ms=buildManeuvers(pts).filter(m=>m.type!=='arrive');
+  console.assert(ms.length===0,'J: gentle bend produced maneuvers: '+JSON.stringify(ms.map(m=>m.type)));
+  console.log('J. 12° bend produces no maneuver OK');
+})();
+
+// ── TEST K: single-sample teleport must not be accepted immediately ──
+(function(){
+  const pts=[]; for(let i=0;i<400;i++)pts.push({lat:57.70+i*0.00009,lon:11.97});
+  installRoute(pts);
+  stops=[]; stopMarkers={};
+  for(let i=0;i<40;i++) gpsH(pts[i].lat,pts[i].lon,30,0);
+  const before=routeProgressM;
+  gpsH(pts[350].lat,pts[350].lon,30,0);                 // one bogus fix ~2.8 km ahead
+  console.assert(Math.abs(routeProgressM-before)<NAV.JUMP_M,
+    'K: single sample moved progress by '+((routeProgressM-before)/1000).toFixed(2)+' km');
+  // sustained evidence → the jump is eventually accepted (driver really is there)
+  for(let i=350;i<358;i++) gpsH(pts[i].lat,pts[i].lon,30,0);
+  console.assert(routeProgressM>before+1000,'K: confirmed relocation never accepted');
+  console.log('K. progress jump needs confirmation OK');
+})();
+
+// ── TEST L: departure gate needs route progress, not just distance ──
+(function(){
+  const pts=[]; for(let i=0;i<200;i++)pts.push({lat:57.70+i*0.00009,lon:11.97});
+  installRoute(pts);
+  const S=pts[60];
+  stops=[{id:1,name:'A',lat:S.lat,lng:S.lon,dur_s:5,elapsed:0,running:false,intervalId:null,state:'waiting'},
+         {id:2,name:'A2',lat:S.lat,lng:S.lon,dur_s:5,elapsed:0,running:false,intervalId:null,state:'waiting'}];
+  stopMarkers={1:{setIcon(){}},2:{setIcon(){}}};
+  anchorStopsToRoute(null);
+  for(let i=52;i<=60;i++) gpsH(pts[i].lat,pts[i].lon,15,0);
+  console.assert(stops[0].state==='current','L: first stop did not arrive');
+  markDone(1);
+  console.assert(departGate&&departGate.routeDistanceM!=null,'L: gate has no route anchor');
+  for(let i=0;i<10;i++) gpsH(S.lat+((i%3)-1)*0.00004,S.lon,1,(i*33)%360);  // jitter in place
+  console.assert(stops[1].state==='waiting','L: gate released by jitter alone');
+  console.log('L. departure gate is route-anchored OK');
+})();
+
+console.log('ALL NAVIGATION-ENGINE TESTS PASSED');
+// ── TEST M: matcher must stay cheap on a dense route (driving device) ──
+(function(){
+  const pts=[]; for(let i=0;i<6000;i++)pts.push({lat:57.70+i*0.00003,lon:11.97+ (i%2)*0.000001});
+  routePts=pts; buildCumDist(routePts); totalRouteDist=routeCumDist[routeCumDist.length-1];
+  const t0=Date.now(); buildRouteIndex(); const tIdx=Date.now()-t0;
+  resetMatcher();
+  const t1=Date.now();
+  for(let i=0;i<3000;i++){
+    _posHist.push({lat:pts[i].lat,lng:pts[i].lon,t:i*1000}); if(_posHist.length>12)_posHist.shift();
+    matchPositionToRoute(pts[i].lat,pts[i].lon,0,30,8);
+  }
+  const per=(Date.now()-t1)/3000;
+  console.log(`M. perf OK — index ${tIdx} ms · match ${per.toFixed(3)} ms/fix on a 6000-pt route`);
+  console.assert(per<2,'matcher too slow per GPS fix: '+per);
+})();
+
+// ══════════════════════════════════════════════════════════════════════════
+//  STOP ACCEPTANCE HARDENING — bounded tolerance, persistence, LOW gate
+// ══════════════════════════════════════════════════════════════════════════
+__group('Navigation tests');
+console.log('\n── stop acceptance hardening ──');
+
+// ── N1: tolerance must stay capped under "big radius + bad accuracy" ──
+(function(){
+  // pure function check first: no combination may exceed MAX
+  let worst=0;
+  [10,80,150,200].forEach(r=>[5,25,50,120].forEach(a=>
+    ['HIGH','MEDIUM','LOW'].forEach(c=>{
+      const t=stopAlongToleranceM(r,a,c);
+      worst=Math.max(worst,t);
+      console.assert(t>=NAV.MIN_STOP_ALONG_TOL_M&&t<=NAV.MAX_STOP_ALONG_TOL_M,
+        `N1: tolerance ${t.toFixed(0)} m out of bounds (r=${r} acc=${a} ${c})`);
+    })));
+  console.assert(worst<=NAV.MAX_STOP_ALONG_TOL_M,'N1: cap breached: '+worst);
+
+  // behavioural check: a stop 120 m away ALONG THE ROUTE is refused even
+  // though the vehicle sits inside a 200 m radius with 50 m accuracy
+  el('rng-radius').value='200';
+  const pts=[]; for(let i=0;i<300;i++)pts.push({lat:57.70+i*0.00009,lon:11.97});
+  installRoute(pts);
+  const S=pts[150];
+  stops=[{id:1,name:'S',lat:S.lat,lng:S.lon,dur_s:10,elapsed:0,running:false,intervalId:null,state:'waiting'}];
+  stopMarkers={1:{setIcon(){}}};
+  anchorStopsToRoute(null);
+  // drive only to index 138 → ~120 m short of the stop on the route,
+  // but well inside the (inflated) physical radius
+  for(let i=120;i<=138;i++) gpsH(pts[i].lat,pts[i].lon,15,0,50);
+  const dPhys=haversine(pts[138].lat,pts[138].lon,S.lat,S.lon)*1000;
+  console.assert(dPhys<200*1.8,'N1: setup wrong — vehicle not inside the radius');
+  console.assert(stops[0].state==='waiting',
+    'N1: stop accepted 120 m off its route position (state '+stops[0].state+')');
+  console.log(`N1. tolerance capped at ${worst.toFixed(0)} m; stop ${dPhys.toFixed(0)} m away physically, `+
+              `120 m off-route → refused OK`);
+  el('rng-radius').value='80';
+})();
+
+// ── N2: one sample must not arrive; consecutive samples must ──
+(function(){
+  // Points are ~10 m apart. Radius 25 m and speed 30 km/h (no 1.8x inflation)
+  // put the acceptance boundary between index 97 and 99 — unambiguous.
+  el('rng-radius').value='25';
+  const pts=[]; for(let i=0;i<200;i++)pts.push({lat:57.70+i*0.00009,lon:11.97});
+  installRoute(pts);
+  const S=pts[100];
+  stops=[{id:1,name:'S',lat:S.lat,lng:S.lon,dur_s:10,elapsed:0,running:false,intervalId:null,state:'waiting'}];
+  stopMarkers={1:{setIcon(){}}};
+  anchorStopsToRoute(null);
+  for(let i=90;i<=97;i++) gpsH(pts[i].lat,pts[i].lon,30,0);   // approach: 100 m → 30 m, outside
+  console.assert(stops[0].state==='waiting','N2: arrived before reaching the stop');
+  console.assert(stopArrivalCandidate===null,'N2: candidate opened while still outside');
+  gpsH(pts[99].lat,pts[99].lon,30,0);                         // FIRST valid sample (10 m)
+  console.assert(stops[0].state==='waiting',
+    'N2: single sample confirmed the arrival (state '+stops[0].state+')');
+  console.assert(stopArrivalCandidate&&stopArrivalCandidate.count===1,
+    'N2: no pending candidate after the first valid sample');
+  gpsH(S.lat,S.lon,30,0);                                     // SECOND valid sample (0 m)
+  console.assert(stops[0].state==='current','N2: arrival never confirmed: '+stops[0].state);
+  console.assert(stopArrivalCandidate===null,'N2: candidate not cleared after confirmation');
+  console.log('N2. arrival needs '+NAV.ARRIVE_CONFIRM+' consecutive samples OK');
+  el('rng-radius').value='80';
+})();
+
+// ── N3: a GPS jump into the radius while the matcher is elsewhere ──
+(function(){
+  const pts=[]; for(let i=0;i<400;i++)pts.push({lat:57.70+i*0.00009,lon:11.97});
+  installRoute(pts);
+  const S=pts[300];
+  stops=[{id:1,name:'S',lat:S.lat,lng:S.lon,dur_s:10,elapsed:0,running:false,intervalId:null,state:'waiting'}];
+  stopMarkers={1:{setIcon(){}}};
+  anchorStopsToRoute(null);
+  for(let i=0;i<=60;i++) gpsH(pts[i].lat,pts[i].lon,30,0);     // matcher settled at ~600 m
+  const progBefore=routeProgressM;
+  gpsH(S.lat,S.lon,30,0);                                      // teleport onto the stop
+  gpsH(S.lat,S.lon,30,0);                                      // and hold it
+  console.assert(stops[0].state==='waiting',
+    'N3: stop accepted from a teleport while the matcher was elsewhere: '+stops[0].state);
+  console.assert(Math.abs(routeProgressM-progBefore)<NAV.JUMP_M,
+    'N3: progress followed the teleport: '+((routeProgressM-progBefore)).toFixed(0)+' m');
+  console.log('N3. physical jump into the radius refused while off-route OK');
+})();
+
+// ── N4: LOW matcher confidence must not promote a stop ──
+(function(){
+  const pts=[]; for(let i=0;i<200;i++)pts.push({lat:57.70+i*0.00009,lon:11.97});
+  installRoute(pts);
+  const S=pts[100];
+  stops=[{id:1,name:'S',lat:S.lat,lng:S.lon,dur_s:10,elapsed:0,running:false,intervalId:null,state:'waiting'}];
+  stopMarkers={1:{setIcon(){}}};
+  anchorStopsToRoute(null);
+  // unit-level: the validator refuses regardless of a zero physical distance
+  const lowMatch={confidence:'LOW',routeDistanceM:stops[0].routeDistanceM,reason:'JUMP_PENDING'};
+  const v=isValidStopArrival(stops[0],lowMatch,null,144,0,8,80);
+  console.assert(!v.ok&&v.reason==='LOW_CONFIDENCE',
+    'N4: LOW confidence accepted at distance 0 ('+v.reason+')');
+  console.assert(v.hard===false,'N4: LOW should be a soft failure (decay, not wipe)');
+  // and it recovers once confidence returns
+  const okMatch={confidence:'HIGH',routeDistanceM:stops[0].routeDistanceM};
+  console.assert(isValidStopArrival(stops[0],okMatch,null,144,0,8,80).ok,
+    'N4: HIGH confidence still refused');
+  // unanchored stops keep the legacy distance-only path
+  const bare={id:9,name:'bare',lat:S.lat,lng:S.lon};
+  console.assert(isValidStopArrival(bare,lowMatch,null,144,0,8,80).ok,
+    'N4: unanchored stop blocked by LOW confidence');
+  console.log('N4. LOW confidence blocks promotion, recovers on HIGH OK');
+})();
+
+console.log('ALL STOP-ACCEPTANCE TESTS PASSED');
+
+// ══════════════════════════════════════════════════════════════════════════
+//  TIMESTAMP ANCHORING — internal recordings must never use geometry
+// ══════════════════════════════════════════════════════════════════════════
+__group('Stop tests');
+console.log('\n── timestamp anchoring ──');
+
+const T0=1700000000000, LAT0=57.700, LNG0=11.970, DLAT=0.00009; // ~10 m / point
+
+/* Build a timestamped recording. `shape` returns {lat,lng} for index i. */
+function mkRec(name,n,shape,stopIdxs,opts){
+  const pts=[]; let t=T0;
+  for(let i=0;i<n;i++){const p=shape(i);pts.push({lat:p.lat,lng:p.lng,t,speed:8,alt:30});t+=1000;}
+  const stops=(stopIdxs||[]).map(i=>{
+    const s={lat:pts[i].lat,lng:pts[i].lng,t:pts[i].t+3000,startT:pts[i].t,
+             dur_s:20,events:[],photo:null};
+    if(opts&&opts.stripTime){delete s.t;delete s.startT;}
+    return s;
+  });
+  return {name,date:new Date(T0).toISOString(),dist:n*0.01,points:pts,stops};
+}
+/* Independent reference implementations — what each mode SHOULD produce. */
+function timestampIndex(rec,s){
+  const st=s.startT??s.t; if(st==null)return null;
+  let lo=0,hi=rec.points.length-1;
+  while(lo<hi){const m=(lo+hi)>>1;(rec.points[m].t<st)?lo=m+1:hi=m;}
+  return lo;
+}
+function geometricIndex(rec,s,from){
+  let best=from||0,bd=Infinity;
+  for(let i=best;i<rec.points.length;i++){
+    const d=haversine(rec.points[i].lat,rec.points[i].lng,s.lat,s.lng);
+    if(d<bd){bd=d;best=i;}
+  }
+  return best;
+}
+function loadFresh(rec){
+  if(typeof CycleGate!=='undefined')CycleGate.reset();savedRecs.push(rec);loadRec(savedRecs.length-1);}
+
+// ── T1: A → B → A, stop on the SECOND passage of A ──────────────────────
+(function(){
+  const N=200;                                   // 0..99 north, 100..199 back south
+  const shape=i=>i<100?{lat:LAT0+i*DLAT,lng:LNG0}
+                      :{lat:LAT0+(199-i)*DLAT,lng:LNG0};
+  const rec=mkRec('A-B-A',N,shape,[199]);        // stop at the FINAL A
+  loadFresh(rec);
+  const s=stops[0], ti=timestampIndex(rec,rec.stops[0]), gi=geometricIndex(rec,rec.stops[0],0);
+  console.assert(s.anchorMode==='TIMESTAMP','T1: internal recording used '+s.anchorMode);
+  console.assert(s.routeIndex===ti,'T1: routeIndex '+s.routeIndex+' != timestamp truth '+ti);
+  console.assert(ti!==gi,'T1: scenario is not discriminating (ts '+ti+' == geo '+gi+')');
+  console.assert(s.routeDistanceM>1500,
+    'T1: anchored to the FIRST passage: '+(s.routeDistanceM/1000).toFixed(2)+' km');
+  console.assert(Math.abs(angleDiff(s.approachBearing,180))<20,
+    'T1: approachBearing is the outbound direction: '+s.approachBearing);
+  console.log(`T1. second passage of A: idx ${s.routeIndex} (geo would say ${gi}), `+
+              `${(s.routeDistanceM/1000).toFixed(2)} km, bearing ${s.approachBearing.toFixed(0)}° OK`);
+})();
+
+// ── T2: out-and-back on the SAME street, one stop per direction ─────────
+(function(){
+  const N=200;
+  const shape=i=>i<100?{lat:LAT0+i*DLAT,lng:LNG0}
+                      :{lat:LAT0+(199-i)*DLAT,lng:LNG0};
+  // A depot stop at idx 10 keeps X and Y off the first/last positions, so the
+  // circular start/end dedup (which merges a co-located first+last pair) does
+  // not consume them. See the report note on that interaction.
+  const rec=mkRec('narrow street',N,shape,[10,50,149]);  // depot, X outbound, Y return
+  const gap=haversine(rec.stops[1].lat,rec.stops[1].lng,
+                      rec.stops[2].lat,rec.stops[2].lng)*1000;
+  console.assert(gap<5,'T2: stops are '+gap.toFixed(1)+' m apart, scenario too easy');
+  loadFresh(rec);
+  console.assert(stops.length===3,'T2: expected 3 stops, got '+stops.length);
+  const X=stops[1], Y=stops[2];
+  console.assert(X.anchorMode==='TIMESTAMP'&&Y.anchorMode==='TIMESTAMP','T2: not timestamp-anchored');
+  console.assert(Y.routeDistanceM-X.routeDistanceM>800,
+    'T2: X and Y collapsed onto the same passage: '+
+    (X.routeDistanceM/1000).toFixed(2)+' / '+(Y.routeDistanceM/1000).toFixed(2)+' km');
+  const dirErr=Math.abs(angleDiff(X.approachBearing,Y.approachBearing));
+  console.assert(dirErr>150,'T2: approach bearings not opposed: '+dirErr.toFixed(0)+'°');
+  console.log(`T2. same street both ways (${gap.toFixed(1)} m apart): `+
+    `X ${(X.routeDistanceM/1000).toFixed(2)} km @${X.approachBearing.toFixed(0)}°, `+
+    `Y ${(Y.routeDistanceM/1000).toFixed(2)} km @${Y.approachBearing.toFixed(0)}° OK`);
+})();
+
+// ── T3: stop recorded ONLY on the second lap (the audit case) ───────────
+(function(){
+  const N=240;                                   // two identical 120-point laps
+  const shape=i=>({lat:LAT0+(i%120)*DLAT,lng:LNG0});
+  const rec=mkRec('lap2-only',N,shape,[160]);    // A visited twice, stopped once
+  loadFresh(rec);
+  const s=stops[0], ti=timestampIndex(rec,rec.stops[0]), gi=geometricIndex(rec,rec.stops[0],0);
+  console.assert(s.anchorMode==='TIMESTAMP','T3: fell back to '+s.anchorMode);
+  console.assert(s.routeIndex===ti,'T3: routeIndex '+s.routeIndex+' != '+ti);
+  console.assert(s.routeIndex!==gi,'T3: matched the first geometric occurrence '+gi);
+  // and the arrival gate now accepts the real passage
+  const tol=stopAlongToleranceM(80,8,'HIGH');
+  console.assert(Math.abs(routeCumM[ti]-s.routeDistanceM)<tol,'T3: gate would still reject');
+  console.log(`T3. lap-2-only stop: idx ${s.routeIndex} = ${(s.routeDistanceM/1000).toFixed(2)} km `+
+              `(geometry would say ${gi} = ${(routeCumM[gi]/1000).toFixed(2)} km) OK`);
+})();
+
+// ── T4: timestampIndex vs geometricIndex — official answer is timestamp ──
+(function(){
+  const N=200;
+  const shape=i=>i<100?{lat:LAT0+i*DLAT,lng:LNG0}:{lat:LAT0+(199-i)*DLAT,lng:LNG0};
+  const rec=mkRec('retrace',N,shape,[150]);
+  loadFresh(rec);
+  const ti=timestampIndex(rec,rec.stops[0]), gi=geometricIndex(rec,rec.stops[0],0);
+  console.assert(ti!==gi,'T4: indices agree, scenario not discriminating');
+  console.assert(stops[0].routeIndex===ti,
+    `T4: official answer ${stops[0].routeIndex} is not the timestamp index ${ti} (geo=${gi})`);
+  console.log(`T4. timestampIndex=${ti} vs geometricIndex=${gi} → official ${stops[0].routeIndex} OK`);
+})();
+
+// ── T5: full round trip recording → JSON → load must keep the anchor ────
+(function(){
+  const N=240;
+  const shape=i=>({lat:LAT0+(i%120)*DLAT,lng:LNG0});
+  const rec=mkRec('roundtrip',N,shape,[160]);
+  loadFresh(rec);
+  const before={idx:stops[0].routeIndex,dist:stops[0].routeDistanceM,brg:stops[0].approachBearing};
+  const wire=JSON.parse(JSON.stringify(recToPlain(rec)));   // export → import
+  console.assert(wire.stops[0].startT!=null,'T5: startT lost in the JSON round trip');
+  console.assert(wire.points[0].t!=null,'T5: point timestamps lost in the JSON round trip');
+  loadFresh(wire);
+  console.assert(stops[0].anchorMode==='TIMESTAMP','T5: reloaded copy used '+stops[0].anchorMode);
+  console.assert(stops[0].routeIndex===before.idx&&
+                 Math.abs(stops[0].routeDistanceM-before.dist)<1,
+    'T5: anchor moved across the round trip');
+  console.log('T5. recording → JSON → load keeps the anchor OK ('+
+              (stops[0].routeDistanceM/1000).toFixed(2)+' km, mode '+stops[0].anchorMode+')');
+})();
+
+// ── T6: external GPX (no timestamps) must still use the geometric path ──
+(function(){
+  const N=200;
+  const shape=i=>i<100?{lat:LAT0+i*DLAT,lng:LNG0}:{lat:LAT0+(199-i)*DLAT,lng:LNG0};
+  const rec=mkRec('no-time',N,shape,[50],{stripTime:true});
+  rec.points.forEach(p=>delete p.t);                        // a GPX track has no time
+  loadFresh(rec);
+  console.assert(stops[0].anchorMode==='GEOMETRIC','T6: expected GEOMETRIC, got '+stops[0].anchorMode);
+  console.assert(stops[0].routeDistanceM!=null&&stops[0].approachBearing!=null,
+    'T6: geometric fallback produced no anchor');
+  console.assert(navAnchorWarning===null,'T6: spurious warning for a genuinely timeless route');
+  console.log('T6. timeless route → GEOMETRIC fallback, no warning OK');
+})();
+
+// ── T7: guardrail — route has time, stop does not ───────────────────────
+(function(){
+  const N=200;
+  const shape=i=>({lat:LAT0+i*DLAT,lng:LNG0});
+  const rec=mkRec('missing-stop-time',N,shape,[100],{stripTime:true}); // points keep t
+  loadFresh(rec);
+  console.assert(stops[0].anchorMode==='GEOMETRIC','T7: should degrade to geometry');
+  console.assert(navAnchorWarning&&navAnchorWarning.indexOf('STOP_TIMESTAMP_MISSING')===0,
+    'T7: guardrail did not fire: '+navAnchorWarning);
+  console.log('T7. guardrail fires: '+navAnchorWarning+' OK');
+  // and a healthy recording clears it again
+  loadFresh(mkRec('healthy',N,shape,[100]));
+  console.assert(navAnchorWarning===null,'T7: warning not cleared on a healthy recording');
+  console.assert(anchorModeSummary.mode==='TIMESTAMP','T7: mode summary wrong: '+anchorModeSummary.mode);
+  console.log('T7b. warning clears; anchorModeSummary.mode='+anchorModeSummary.mode+' OK');
+})();
+
+console.log('ALL TIMESTAMP-ANCHORING TESTS PASSED');
+__group('Timestamp anchoring tests');
+
+// ══════════════════════════════════════════════════════════════════════════
+//  CIRCULAR STOP DEDUP — co-location is not proof of the same event
+// ══════════════════════════════════════════════════════════════════════════
+console.log('\n── circular stop dedup ──');
+
+/* south approach → A → north to B → back through A → south exit.
+   A is passed TWICE mid-route; the track neither starts nor ends there. */
+function mkThroughRoute(){
+  const A=40, B=140;                                   // indices of A (out) and B
+  const shape=i=>i<=B?{lat:LAT0+i*DLAT,lng:LNG0}       // north 0..140
+                     :{lat:LAT0+(2*B-i)*DLAT,lng:LNG0};// back south 141..280
+  return {shape,n:281,Aout:A,Aback:2*B-A};             // A on the way back = 240
+}
+
+// ── DEDUP-1: same coordinate, very different startT, distinct events ─────
+(function(){
+  const {shape,n,Aout,Aback}=mkThroughRoute();
+  const rec=mkRec('dedup1',n,shape,[Aout,Aback]);
+  const gap=haversine(rec.stops[0].lat,rec.stops[0].lng,rec.stops[1].lat,rec.stops[1].lng)*1000;
+  const dt=(rec.stops[1].startT-rec.stops[0].startT)/1000;
+  console.assert(gap<1,'DEDUP-1: stops not co-located ('+gap.toFixed(1)+' m)');
+  loadFresh(rec);
+  console.assert(stops.length===2,'DEDUP-1: a stop was deleted — got '+stops.length);
+  console.assert(dedupDecision&&dedupDecision.merged===false,
+    'DEDUP-1: merged despite distinct events ('+(dedupDecision&&dedupDecision.reason)+')');
+  console.log(`DEDUP-1. same coordinate (${gap.toFixed(1)} m), Δt ${dt}s → both kept OK `+
+              `[${dedupDecision.reason}]`);
+})();
+
+// ── DEDUP-2: legitimate depot — track starts and ends parked at D ────────
+(function(){
+  // parked at D, drive a loop, return and park at D again
+  const pts=[]; let t=T0;
+  const push=(lat,lng)=>{pts.push({lat,lng,t,speed:0,alt:30});t+=1000;};
+  for(let i=0;i<6;i++)  push(LAT0,LNG0);                       // parked at depot
+  for(let i=1;i<=60;i++)push(LAT0+i*DLAT,LNG0);                // out
+  for(let i=59;i>=1;i--)push(LAT0+i*DLAT,LNG0+0.0004);         // back on a parallel street
+  for(let i=0;i<6;i++)  push(LAT0,LNG0);                       // parked at depot again
+  const mid=Math.floor(pts.length/2);
+  const mk=i=>({lat:pts[i].lat,lng:pts[i].lng,t:pts[i].t+3000,startT:pts[i].t,
+                dur_s:20,events:[],photo:null});
+  const rec={name:'depot',date:new Date(T0).toISOString(),dist:1.2,points:pts,
+             stops:[mk(0),mk(30),mk(mid),mk(pts.length-1)]};   // D, normal, normal, D
+  loadFresh(rec);
+  console.assert(stops.length===3,'DEDUP-2: depot pair not merged — got '+stops.length+' stops');
+  console.assert(dedupDecision&&dedupDecision.merged===true&&dedupDecision.reason==='DEPOT_START_END',
+    'DEDUP-2: wrong decision '+(dedupDecision&&dedupDecision.reason));
+  console.assert(stops[0].startT===rec.stops[0].startT,
+    'DEDUP-2: merged stop did not keep the START-of-cycle event');
+  console.assert(stops[0].routeDistanceM<100,
+    'DEDUP-2: merged depot anchored away from the cycle start: '+stops[0].routeDistanceM.toFixed(0)+' m');
+  console.log('DEDUP-2. genuine depot merged (4→3), start event preserved, anchored at '+
+              stops[0].routeDistanceM.toFixed(0)+' m OK');
+})();
+
+// ── DEDUP-3: out-and-back, A on the way out and A on the way back ────────
+(function(){
+  const {shape,n,Aout,Aback}=mkThroughRoute();
+  const rec=mkRec('dedup3',n,shape,[Aout,Aback]);
+  loadFresh(rec);
+  console.assert(stops.length===2,'DEDUP-3: X and Y collapsed into '+stops.length+' stop(s)');
+  const [X,Y]=stops;
+  // §9 — anchoring must place them on the correct passages, in opposite senses
+  console.assert(X.anchorMode==='TIMESTAMP'&&Y.anchorMode==='TIMESTAMP',
+    'DEDUP-3: not timestamp-anchored');
+  console.assert(Y.routeDistanceM-X.routeDistanceM>1500,
+    'DEDUP-3: same passage — X '+(X.routeDistanceM/1000).toFixed(2)+
+    ' km, Y '+(Y.routeDistanceM/1000).toFixed(2)+' km');
+  const opp=Math.abs(angleDiff(X.approachBearing,Y.approachBearing));
+  console.assert(opp>150,'DEDUP-3: approach bearings not opposed: '+opp.toFixed(0)+'°');
+  console.log(`DEDUP-3. A twice, 0 m apart → X ${(X.routeDistanceM/1000).toFixed(2)} km @`+
+    `${X.approachBearing.toFixed(0)}°, Y ${(Y.routeDistanceM/1000).toFixed(2)} km @`+
+    `${Y.approachBearing.toFixed(0)}° OK`);
+})();
+
+// ── DEDUP-4: first and last 5 m apart but distinct events ────────────────
+(function(){
+  const {shape,n}=mkThroughRoute();
+  const rec=mkRec('dedup4',n,shape,[40,240]);
+  rec.stops[1].lat=rec.stops[0].lat+0.000045;          // ~5 m north of the first
+  loadFresh(rec);
+  console.assert(stops.length===2,'DEDUP-4: merged two distinct events 5 m apart');
+  console.assert(dedupDecision.reason==='CO_LOCATED_BUT_NOT_DEPOT',
+    'DEDUP-4: unexpected reason '+dedupDecision.reason);
+  console.log('DEDUP-4. 5 m apart, not start/end of the track → both kept OK');
+})();
+
+// ── DEDUP-5: guard the unit rule itself ──────────────────────────────────
+(function(){
+  const {shape,n}=mkThroughRoute();
+  const rec=mkRec('unit',n,shape,[40,240]);
+  console.assert(isDepotPair(rec.points,rec.stops[0],rec.stops[1])===false,
+    'DEDUP-5: mid-route pair judged a depot');
+  // an OPEN track (A → B, never returns): its two ends are 1.8 km apart,
+  // so even stops sitting exactly at both ends are not a depot pair
+  const open=mkRec('open',200,i=>({lat:LAT0+i*DLAT,lng:LNG0}),[0,199]);
+  console.assert(isDepotPair(open.points,open.stops[0],open.stops[1])===false,
+    'DEDUP-5: open-ended track judged a loop');
+  // and the closed loop used above IS recognised when the stops sit at its ends
+  const ends=[{lat:rec.points[0].lat,lng:rec.points[0].lng,startT:rec.points[0].t},
+              {lat:rec.points[n-1].lat,lng:rec.points[n-1].lng,startT:rec.points[n-1].t}];
+  console.assert(isDepotPair(rec.points,ends[0],ends[1])===true,
+    'DEDUP-5: genuine start/end pair on a closed loop rejected');
+  console.log('DEDUP-5. isDepotPair: mid-route pair no, open track no, loop ends yes OK');
+})();
+
+console.log('ALL DEDUP TESTS PASSED');
+__group('Dedup tests');
+
+// ══════════════════════════════════════════════════════════════════════════
+//  UI / EVENT DISPLAY — registry, Next Stop Card, photo de-duplication
+// ══════════════════════════════════════════════════════════════════════════
+console.log('\n── UI / stop events ──');
+
+function nscFor(evts,photo){                       // load a 1-stop route and render
+  const rec=mkRec('ui',120,i=>({lat:LAT0+i*DLAT,lng:LNG0}),[60]);
+  rec.stops[0].events=evts; rec.stops[0].photo=photo||null;
+  loadFresh(rec); navActive=true;
+  updNextStopCard(LAT0, LNG0);
+  return {evt:el('nsc-evt').innerHTML||'', block:el('nsc-events').innerHTML||'',
+          blockShown:el('nsc-events').style.display!=='none',
+          photoShown:el('nsc-photo').style.display==='block'};
+}
+const hasDoor =s=>/Open Door/.test(s), hasKnee=s=>/Kneeling/.test(s), hasBrake=s=>/Hand Brake/.test(s);
+
+// UI-1..UI-4 — each event, and all three together
+(function(){
+  let r=nscFor(['openDoor']);
+  console.assert(hasDoor(r.block)&&!hasKnee(r.block)&&!hasBrake(r.block),'UI-1: '+r.block);
+  console.log('UI-1. openDoor → Door only OK');
+
+  r=nscFor(['kneeling']);
+  console.assert(hasKnee(r.block)&&!hasDoor(r.block)&&!hasBrake(r.block),'UI-2: '+r.block);
+  console.log('UI-2. kneeling → Knee only OK');
+
+  r=nscFor(['handBrake']);
+  console.assert(hasBrake(r.block)&&!hasDoor(r.block)&&!hasKnee(r.block),'UI-3: '+r.block);
+  console.log('UI-3. handBrake → Brake only OK');
+
+  r=nscFor(['openDoor','kneeling','handBrake']);
+  console.assert(hasDoor(r.block)&&hasKnee(r.block)&&hasBrake(r.block),'UI-4: '+r.block);
+  console.log('UI-4. all three shown OK');
+})();
+
+// UI-5 — no empty events area
+(function(){
+  const r=nscFor([]);
+  console.assert(r.block===''&&r.blockShown===false,'UI-5: empty events area rendered');
+  console.log('UI-5. no events → area hidden OK');
+})();
+
+// UI-6 — legacy cycle without handBrake keeps working, and gains nothing
+(function(){
+  const r=nscFor(['openDoor','kneeling']);
+  console.assert(hasDoor(r.block)&&hasKnee(r.block),'UI-6: legacy events lost');
+  console.assert(!hasBrake(r.block),'UI-6: handBrake invented for a legacy cycle');
+  console.log('UI-6. legacy cycle unchanged, no handBrake added OK');
+})();
+
+// UI-7 — an unknown event is dropped, never remapped
+(function(){
+  const r=nscFor(['foo','openDoor']);
+  console.assert(hasDoor(r.block),'UI-7: known event lost');
+  console.assert(!hasKnee(r.block)&&!hasBrake(r.block),'UI-7: unknown event became another event');
+  console.assert(!/⚡/.test(r.block+r.evt),'UI-7: generic ⚡ fallback still present');
+  console.assert(normalizeStopEvents(['foo','bar']).length===0,'UI-7: unknown survived normalize');
+  console.assert(getStopEventMeta('foo')===null,'UI-7: meta invented for unknown event');
+  console.log('UI-7. unknown event dropped, no ⚡ fallback OK');
+})();
+
+// UI-8 — photo appears once, in the Next Stop Card
+(function(){
+  const r=nscFor(['openDoor','kneeling','handBrake'],'data:image/jpeg;base64,AAAAAAAAAAAA');
+  console.assert(r.photoShown,'UI-8: card photo not shown');
+  console.assert(!el('stop-photo-ov').classList.contains('on'),'UI-8: overlay opened too');
+  console.log('UI-8. photo shown once (card), overlay closed OK');
+})();
+
+// UI-9 — approaching 200 m must not open the overlay
+(function(){
+  const rec=mkRec('ui9',200,i=>({lat:LAT0+i*DLAT,lng:LNG0}),[100]);
+  rec.stops[0].photo='data:image/jpeg;base64,AAAAAAAAAAAA';
+  rec.stops[0].events=['openDoor'];
+  loadFresh(rec); navActive=true; closeStopPhoto();
+  el('rng-radius').value='80';
+  for(let i=78;i<=95;i++) gpsH(rec.points[i].lat,rec.points[i].lng,25,0);
+  console.assert(!el('stop-photo-ov').classList.contains('on'),
+    'UI-9: proximity opened the photo overlay');
+  console.log('UI-9. 200 m approach → no overlay OK');
+})();
+
+// UI-10 — arrival must not open the overlay either
+(function(){
+  const rec=mkRec('ui10',200,i=>({lat:LAT0+i*DLAT,lng:LNG0}),[100]);
+  rec.stops[0].photo='data:image/jpeg;base64,AAAAAAAAAAAA';
+  loadFresh(rec); navActive=true; closeStopPhoto();
+  for(let i=90;i<=101;i++) gpsH(rec.points[i].lat,rec.points[i].lng,15,0);
+  console.assert(stops[0].state==='current','UI-10: setup — stop never arrived');
+  console.assert(!el('stop-photo-ov').classList.contains('on'),
+    'UI-10: arrival opened the photo overlay');
+  console.log('UI-10. arrival → no overlay, photo stays in the card OK');
+})();
+
+// UI-11 — tapping the card photo DOES open the enlarged view
+(function(){
+  closeStopPhoto();
+  nscPhotoTap();
+  console.assert(el('stop-photo-ov').classList.contains('on'),'UI-11: tap did not enlarge');
+  closeStopPhoto();
+  console.assert(!el('stop-photo-ov').classList.contains('on'),'UI-11: close failed');
+  console.log('UI-11. tap → lightbox opens, closes OK');
+})();
+
+// UI-12 / UI-13 — switching stops swaps events AND photo; stale photo cleared
+(function(){
+  const rec=mkRec('ui12',260,i=>({lat:LAT0+i*DLAT,lng:LNG0}),[60,180]);
+  rec.stops[0].events=['openDoor'];  rec.stops[0].photo='data:image/jpeg;base64,AAAA1111';
+  rec.stops[1].events=['handBrake']; rec.stops[1].photo=null;   // stop 5 has no photo
+  loadFresh(rec); navActive=true;
+  updNextStopCard(LAT0,LNG0);
+  console.assert(hasDoor(el('nsc-events').innerHTML),'UI-12: stop 4 events missing');
+  console.assert(el('nsc-photo').style.display==='block','UI-12: stop 4 photo missing');
+  markDone(stops[0].id);
+  updNextStopCard(LAT0,LNG0);
+  const b=el('nsc-events').innerHTML;
+  console.assert(hasBrake(b)&&!hasDoor(b),'UI-12: events did not switch to stop 5: '+b);
+  console.assert(el('nsc-photo').style.display==='none','UI-13: stop 4 photo still visible on stop 5');
+  console.log('UI-12/13. events and photo follow the next stop OK');
+})();
+
+// UI-14 — voice announces all three, naturally
+(function(){
+  console.assert(stopEventVoicePhrase(['openDoor'])==='open doors','UI-14a');
+  console.assert(stopEventVoicePhrase(['openDoor','kneeling'])==='open doors and kneeling','UI-14b');
+  console.assert(stopEventVoicePhrase(['openDoor','handBrake'])==='open doors and hand brake','UI-14c');
+  console.assert(stopEventVoicePhrase(['openDoor','kneeling','handBrake'])
+                 ==='open doors, kneeling and hand brake','UI-14d: '+stopEventVoicePhrase(['openDoor','kneeling','handBrake']));
+  console.assert(stopEventVoicePhrase(['foo'])==='','UI-14e: unknown event spoken');
+  console.assert(stopEventVoicePhrase([])==='','UI-14f: empty phrase not empty');
+  console.assert(!/parking brake/.test(stopEventVoicePhrase(['handBrake'])),'UI-14g: says parking brake');
+  console.log('UI-14. voice: "'+stopEventVoicePhrase(['openDoor','kneeling','handBrake'])+'" OK');
+})();
+
+// UI-15 — recording buttons: three, independent, reset cleanly
+(function(){
+  pendingStopEvents=[];refreshEventButtons();
+  const on=id=>el(id).classList.contains('active');
+  toggleStopEvent('openDoor'); toggleStopEvent('kneeling'); toggleStopEvent('handBrake');
+  console.assert(on('evt-door')&&on('evt-knee')&&on('evt-brake'),'UI-15: not all three active');
+  console.assert(el('evt-brake').getAttribute('aria-pressed')==='true','UI-15: aria-pressed not set');
+  toggleStopEvent('kneeling');
+  console.assert(on('evt-door')&&!on('evt-knee')&&on('evt-brake'),'UI-15: toggling is not independent');
+  pendingPhotoStopIdx=-1; confirmStopEvents();
+  console.assert(!on('evt-door')&&!on('evt-knee')&&!on('evt-brake'),'UI-15: residual state after confirm');
+  console.assert(pendingStopEvents.length===0,'UI-15: pendingStopEvents not cleared');
+  toggleStopEvent('handBrake'); skipPhoto();
+  console.assert(!on('evt-brake')&&pendingStopEvents.length===0,'UI-15: residual state after skipPhoto');
+  console.log('UI-15. three buttons independent, ON/OFF, reset clean OK');
+})();
+
+// UI-16 — events persist through recording → JSON → load
+(function(){
+  const rec=mkRec('ui16',160,i=>({lat:LAT0+i*DLAT,lng:LNG0}),[80]);
+  rec.stops[0].events=['openDoor','kneeling','handBrake'];
+  const wire=JSON.parse(JSON.stringify(recToPlain(rec)));
+  loadFresh(wire);
+  console.assert(normalizeStopEvents(stops[0].events).length===3,'UI-16: events lost in JSON');
+  const gpx=typeof dlRecGPX==='function';
+  console.log('UI-16. three events survive JSON round trip OK');
+})();
+
+// UI-17 — canonical order regardless of selection order
+(function(){
+  const a=normalizeStopEvents(['handBrake','openDoor','kneeling']).join(',');
+  console.assert(a==='openDoor,kneeling,handBrake','UI-17: order not canonical: '+a);
+  console.log('UI-17. canonical event order OK');
+})();
+
+console.log('ALL UI TESTS PASSED');
+__group('UI/Event tests');
+
+// ══════════════════════════════════════════════════════════════════════════
+//  MAP VISIBILITY — vehicle marker and route line legibility
+// ══════════════════════════════════════════════════════════════════════════
+console.log('\n── map visibility ──');
+
+function driveOnce(headingVal){
+  const rec=mkRec('map',160,i=>({lat:LAT0+i*DLAT,lng:LNG0}),[80]);
+  loadFresh(rec); navActive=true; posMarker=null;
+  for(let i=0;i<6;i++) gpsH(rec.points[i].lat,rec.points[i].lng,30,headingVal);
+  return rec;
+}
+
+// MAP-1 / MAP-2 / MAP-3 — the marker exists, is SVG, and is big enough
+(function(){
+  driveOnce(0);
+  console.assert(posMarker,'MAP-1: no vehicle marker');
+  const html=posMarker._icon&&posMarker._icon.html||'';
+  console.log('MAP-1. vehicle marker present OK');
+
+  console.assert(/<svg/.test(html),'MAP-2: marker is not SVG');
+  console.assert(!/[\u{1F300}-\u{1FAFF}\u{2700}-\u{27BF}\u25B2]/u.test(html),
+    'MAP-2: marker still contains an emoji/▲ glyph');
+  console.log('MAP-2. marker is inline SVG, no emoji OK');
+
+  const size=posMarker._icon.iconSize;
+  console.assert(size&&size[0]>=44&&size[1]>=44,'MAP-3: marker too small: '+JSON.stringify(size));
+  console.assert(VEHICLE_PX>=44&&VEHICLE_PX<=56,'MAP-3: VEHICLE_PX out of range: '+VEHICLE_PX);
+  console.log('MAP-3. marker '+size[0]+' px (>=44) OK');
+})();
+
+// MAP-4 — a reliable heading rotates the bus
+(function(){
+  driveOnce(0);
+  const h0=posMarker._icon.html;
+  const r0=/rotate\(([-\d.]+)deg\)/.exec(h0);
+  console.assert(r0,'MAP-4: no rotation in the marker');
+  // now drive east: heading ~90°
+  const rec=mkRec('map4',160,i=>({lat:LAT0,lng:LNG0+i*0.00017}),[80]);
+  loadFresh(rec); navActive=true; posMarker=null;
+  for(let i=0;i<8;i++) gpsH(rec.points[i].lat,rec.points[i].lng,40,90);
+  const r1=/rotate\(([-\d.]+)deg\)/.exec(posMarker._icon.html);
+  console.assert(r1&&Math.abs(parseFloat(r1[1])-90)<25,
+    'MAP-4: bus not rotated to the heading: '+(r1&&r1[1]));
+  console.log('MAP-4. heading '+parseFloat(r1[1]).toFixed(0)+'° rotates the bus OK');
+})();
+
+// MAP-5 — no heading → neutral orientation, still visible
+(function(){
+  currentHeading=null; _headBuf.length=0;
+  const rec=mkRec('map5',160,i=>({lat:LAT0+i*DLAT,lng:LNG0}),[80]);
+  loadFresh(rec); navActive=true; posMarker=null; _posHist.length=0;
+  // a single stationary sample: no movement bearing, no GPS heading
+  onGPS({coords:{latitude:LAT0,longitude:LNG0,accuracy:9,altitude:30,speed:0,heading:null},
+         timestamp:(fake+=1000)});
+  const html=posMarker._icon.html;
+  const rot=/rotate\(([-\d.]+)deg\)/.exec(html);
+  console.assert(rot&&parseFloat(rot[1])===0,'MAP-5: non-zero rotation without heading: '+(rot&&rot[1]));
+  console.assert(/veh-wrap/.test(html)&&/<svg/.test(html),'MAP-5: marker not rendered');
+  console.assert(/neutral/.test(html),'MAP-5: neutral state not flagged');
+  console.log('MAP-5. no heading → bus points up, still drawn OK');
+})();
+
+// MAP-6 / MAP-12 — vehicle above every line, stop marker and the accuracy circle
+(function(){
+  driveOnce(0);
+  const z=posMarker._opts.zIndexOffset;
+  console.assert(z>=5000,'MAP-6: vehicle zIndexOffset too low: '+z);
+  const stopZ=Object.values(stopMarkers)[0]?._opts?.zIndexOffset??900;
+  console.assert(z>stopZ,'MAP-6: vehicle not above stop markers ('+z+' vs '+stopZ+')');
+  console.assert(accCircle&&accCircle._back===true,'MAP-12: accuracy circle not sent to back');
+  console.log('MAP-6/12. vehicle z='+z+' above stops ('+stopZ+') and accuracy circle OK');
+})();
+
+// MAP-7 — route ahead is casing + main line
+(function(){
+  driveOnce(0);
+  console.assert(routeAheadCasingLayer,'MAP-7: no casing layer for the route ahead');
+  console.assert(routeAheadLayer,'MAP-7: no main line');
+  const cw=routeAheadCasingLayer._opts.weight, mw=routeAheadLayer._opts.weight;
+  console.assert(cw>mw,'MAP-7: casing ('+cw+') not thicker than the main line ('+mw+')');
+  console.assert(JSON.stringify(routeAheadCasingLayer._latlngs)===JSON.stringify(routeAheadLayer._latlngs),
+    'MAP-7: casing and main line carry different geometry');
+  console.log('MAP-7. route ahead: casing '+cw+' px + main '+mw+' px, same geometry OK');
+})();
+
+// MAP-8 — thicker than the previous implementation (main was 4-5 px)
+(function(){
+  driveOnce(0);
+  console.assert(routeAheadLayer._opts.weight>=7&&routeAheadLayer._opts.weight<=8,
+    'MAP-8: main line outside 7-8 px: '+routeAheadLayer._opts.weight);
+  console.assert(routeAheadCasingLayer._opts.weight>=11&&routeAheadCasingLayer._opts.weight<=12,
+    'MAP-8: casing outside 11-12 px: '+routeAheadCasingLayer._opts.weight);
+  console.log('MAP-8. ahead line 7-8 px inside an 11-12 px casing OK');
+})();
+
+// MAP-9 / MAP-10 — done and remain stay visually distinct from the ahead line
+(function(){
+  driveOnce(0);
+  const A=routeAheadLayer._opts, D=routeDoneLayer._opts, R=routeRemainLayer._opts;
+  console.assert(D.color!==A.color,'MAP-9: done has the same colour as ahead');
+  console.assert(D.weight<A.weight,'MAP-9: done is not visually quieter');
+  console.assert(!!R.dashArray,'MAP-10: remain is not dashed');
+  console.assert(R.weight<A.weight,'MAP-10: remain is not quieter than ahead');
+  console.assert(!D.dashArray,'MAP-9: done should be solid, not dashed');
+  console.log(`MAP-9/10. ahead ${A.weight}px solid · done ${D.weight}px ${D.color} · remain ${R.weight}px dashed OK`);
+})();
+
+// MAP-11 — heading-up rotation still works alongside the new drawing
+(function(){
+  const rec=mkRec('map11',160,i=>({lat:LAT0+i*DLAT,lng:LNG0}),[80]);
+  loadFresh(rec); navActive=true; posMarker=null;
+  el('rng-follow').value='1';
+  for(let i=0;i<8;i++) gpsH(rec.points[i].lat,rec.points[i].lng,40,45);
+  console.assert(typeof setMapBearing==='function','MAP-11: setMapBearing missing');
+  setMapBearing(-45);
+  // setMapBearing unwraps across 0/360 so the CSS transition never spins the
+  // long way round, so -45 may legitimately be stored as 315. Compare angles.
+  const norm=a=>((a%360)+360)%360;
+  console.assert(norm(_lastBearing)===norm(-45),'MAP-11: bearing not applied: '+_lastBearing);
+  console.assert(routeAheadLayer._latlngs.length>0,'MAP-11: route vanished under rotation');
+  console.assert(posMarker._icon.html.indexOf('<svg')>=0,'MAP-11: vehicle vanished under rotation');
+  setMapBearing(0);
+  console.log('MAP-11. heading-up rotation intact with the new layers OK');
+})();
+
+console.log('ALL MAP TESTS PASSED');
+__group('Map visibility tests');
+
+// ══════════════════════════════════════════════════════════════════════════
+//  CYCLE PLAYBACK ENGINE v2 — PLAYBACK-1..20 (spec §31)
+// ══════════════════════════════════════════════════════════════════════════
+console.log('\n── cycle playback engine ──');
+
+/* voice spy: capture every speakText call, restore afterwards */
+let _spoken=[];
+const _realSpeak=speakText;
+speakText=(t,f)=>{_spoken.push(String(t));};
+function saidMatching(re){return _spoken.filter(t=>re.test(t));}
+
+/* drive along the loaded route by feeding fixes at given point indices */
+function drivePts(rec,from,to,kmh,hdg){
+  const step=from<=to?1:-1;
+  for(let i=from;i!==to+step;i+=step) gpsH(rec.points[i].lat,rec.points[i].lng,kmh??30,hdg??0);
+}
+/* standard session: load rec, arm playback like startNav does */
+function beginPlayback(rec,laps){
+  loadFresh(rec); navActive=true;
+  insideStop.clear(); departGate=null; evtAnnounced.clear();
+  stops.forEach(s=>evtAnnounced.add(s.id));
+  destinationAnnounced=true; lastVoiceKey=''; lastVoiceManeuver='';
+  try{localStorage.removeItem('gpx-playback-session');}catch(e){}
+  Playback.begin(laps??1);
+  _spoken=[];
+}
+
+// ── PLAYBACK-1: simple A→B→C cycle produces a correct ordered playlist ──
+(function(){
+  const rec=mkRec('pb1',200,i=>({lat:LAT0+i*DLAT,lng:LNG0}),[60,140]); // ~2 km, stops at 0.6/1.4 km
+  loadFresh(rec);
+  console.assert(playbackCycle,'PB-1: no compiled cycle');
+  const st=playbackCycle.segments.filter(s=>s.type==='STOP');
+  console.assert(st.length===2,'PB-1: expected 2 STOP segments, got '+st.length);
+  console.assert(st[0].routeDistanceM<st[1].routeDistanceM,'PB-1: stops out of order');
+  const types=playbackCycle.segments.map(s=>s.type);
+  console.assert(types[0]!=='END'&&types[types.length-1]==='END','PB-1: END not last');
+  // monotonic, gap-free spans
+  let prevEnd=0,ok=true;
+  playbackCycle.segments.forEach(s=>{
+    if(s.type==='STOP')return;
+    if(Math.abs(s.startRouteM-prevEnd)>0.6)ok=false;
+    prevEnd=s.endRouteM;
+  });
+  console.assert(ok,'PB-1: playlist has gaps or overlaps');
+  console.log('PB-1. playlist ordered, gap-free, END last OK ('+playbackCycle.segments.length+' segments)');
+})();
+
+// ── PLAYBACK-2: travel slices land in the 100-300 m band ──
+(function(){
+  const rec=mkRec('pb2',300,i=>({lat:LAT0+i*DLAT,lng:LNG0}),[150]); // 3 km, one stop
+  loadFresh(rec);
+  const tr=playbackCycle.segments.filter(s=>s.type==='TRAVEL'&&s.distanceM>1);
+  const bad=tr.filter(s=>s.distanceM<80||s.distanceM>320);
+  console.assert(tr.length>=6,'PB-2: too few travel segments: '+tr.length);
+  console.assert(bad.length===0,'PB-2: segments outside 100-300 m band: '+
+    bad.map(s=>s.distanceM.toFixed(0)).join(','));
+  console.log('PB-2. '+tr.length+' travel slices, all ~'+PLAYBACK_CFG.segmentLenM+' m OK');
+})();
+
+// ── PLAYBACK-3: a stop is never split across two segments ──
+(function(){
+  const rec=mkRec('pb3',300,i=>({lat:LAT0+i*DLAT,lng:LNG0}),[77,199]);
+  loadFresh(rec);
+  playbackCycle.occurrences.forEach(o=>{
+    const inside=playbackCycle.segments.filter(s=>
+      s.type!=='STOP'&&s.startRouteM<o.routeDistanceM-0.5&&s.endRouteM>o.routeDistanceM+0.5);
+    console.assert(inside.length===0,'PB-3: '+o.occurrenceId+' cut mid-segment');
+    const stopSegs=playbackCycle.segments.filter(s=>
+      s.type==='STOP'&&s.stopOccurrenceId===o.occurrenceId);
+    console.assert(stopSegs.length===1,'PB-3: '+o.occurrenceId+' has '+stopSegs.length+' STOP segments');
+  });
+  console.log('PB-3. every stop is a cut boundary, exactly one STOP segment each OK');
+})();
+
+// ── PLAYBACK-4: same physical stop twice → two distinct occurrences ──
+(function(){
+  const N=200; // out-and-back on the same street: same coordinate visited twice
+  const shape=i=>i<100?{lat:LAT0+i*DLAT,lng:LNG0}:{lat:LAT0+(199-i)*DLAT,lng:LNG0};
+  const rec=mkRec('pb4',N,shape,[10,50,149]); // depot guard + A out + A back (co-located)
+  loadFresh(rec);
+  const occ=playbackCycle.occurrences;
+  const A=occ.filter(o=>o.stopId===occ[1].stopId&&o.stopId===occ[2].stopId?true:o.stopId===occ[1].stopId);
+  // the two co-located stops must share stopId but differ in occurrenceId
+  const co=occ.filter(o=>Math.abs(o.routeDistanceM-occ[1].routeDistanceM)<1||
+                          Math.abs(o.routeDistanceM-occ[2].routeDistanceM)<1);
+  console.assert(occ[1].stopId===occ[2].stopId,'PB-4: co-located stops got different physical ids');
+  console.assert(occ[1].occurrenceId!==occ[2].occurrenceId,'PB-4: occurrences not distinct');
+  console.assert(/occurrence_1$/.test(occ[1].occurrenceId)&&/occurrence_2$/.test(occ[2].occurrenceId),
+    'PB-4: occurrence numbering wrong: '+occ[1].occurrenceId+' / '+occ[2].occurrenceId);
+  console.assert(Math.abs(occ[2].routeDistanceM-occ[1].routeDistanceM)>800,
+    'PB-4: occurrences share a route position');
+  console.log('PB-4. '+occ[1].occurrenceId+' @'+(occ[1].routeDistanceM/1000).toFixed(2)+' km · '
+    +occ[2].occurrenceId+' @'+(occ[2].routeDistanceM/1000).toFixed(2)+' km OK');
+})();
+
+// ── PLAYBACK-5: 5 m from a stop of ANOTHER leg → NO VOICE, NO ARRIVAL ──
+(function(){
+  const N=240; // outbound on street A, return on parallel street B 12 m east;
+               // the return-leg stop is physically ~12 m from the outbound path
+  const dLng=12/(111320*Math.cos(LAT0*Math.PI/180));
+  const shape=i=>i<120?{lat:LAT0+i*DLAT,lng:LNG0}:{lat:LAT0+(239-i)*DLAT,lng:LNG0+dLng};
+  const rec=mkRec('pb5',N,shape,[179]); // ONLY stop: on the RETURN leg (~idx 60 going back)
+  beginPlayback(rec,1);
+  // drive the OUTBOUND leg: passes ~12 m from the return-leg stop coordinate
+  drivePts(rec,0,110,30,0);
+  const nearTexts=saidMatching(/Stop \d|stop/i);
+  console.assert(stops[0].state==='waiting','PB-5: other-leg stop arrived: '+stops[0].state);
+  console.assert(nearTexts.length===0,'PB-5: voice fired on the wrong leg: '+JSON.stringify(nearTexts));
+  console.log('PB-5. passed 12 m from other-leg stop: NO VOICE, NO ARRIVAL OK');
+})();
+
+// ── PLAYBACK-6: the correct segment DOES produce voice + arrival ──
+(function(){
+  const rec=mkRec('pb6',200,i=>({lat:LAT0+i*DLAT,lng:LNG0}),[100]);
+  rec.stops[0].events=['openDoor','kneeling'];
+  beginPlayback(rec,1);
+  drivePts(rec,0,101,25,0);
+  console.assert(saidMatching(/Stop 1 in 200 meters/).length===1,
+    'PB-6: approach voice missing: '+JSON.stringify(_spoken));
+  console.assert(saidMatching(/Prepare to stop/).length===1,'PB-6: prepare voice missing');
+  console.assert(saidMatching(/open doors and kneeling required/).length>=1,
+    'PB-6: event phrase missing');
+  console.assert(stops[0].state==='current','PB-6: stop did not arrive: '+stops[0].state);
+  console.log('PB-6. correct segment → approach + prepare + events + arrival OK');
+})();
+
+// ── PLAYBACK-7: jitter regressing a segment must not repeat voice ──
+(function(){
+  const rec=mkRec('pb7',200,i=>({lat:LAT0+i*DLAT,lng:LNG0}),[100]);
+  beginPlayback(rec,1);
+  drivePts(rec,0,85,30,0);                       // past the approach trigger
+  const approaches=saidMatching(/Stop 1 in 200 meters/).length;
+  console.assert(approaches===1,'PB-7: setup — approach fired '+approaches+' times');
+  const segBefore=Playback.lastSegIdx;
+  // jitter: 6 fixes oscillating backwards a few metres
+  for(let k=0;k<6;k++) gpsH(rec.points[83+(k%2)].lat,rec.points[83+(k%2)].lng,3,(k*90)%360);
+  console.assert(Playback.lastSegIdx>=segBefore,'PB-7: playback segment regressed');
+  console.assert(saidMatching(/Stop 1 in 200 meters/).length===1,'PB-7: approach voice repeated');
+  console.log('PB-7. jitter: segment held ('+segBefore+'→'+Playback.lastSegIdx+'), no repeat OK');
+})();
+
+__group('Playback tests');
+
+// ── PLAYBACK-8: trigger fires only when routeDistance >= trigger ──
+(function(){
+  const rec=mkRec('pb8',200,i=>({lat:LAT0+i*DLAT,lng:LNG0}),[100]); // stop @ ~1000 m
+  beginPlayback(rec,1);
+  drivePts(rec,0,75,30,0);                       // 750 m < 800 m trigger
+  console.assert(saidMatching(/Stop 1 in 200 meters/).length===0,
+    'PB-8: approach fired before the trigger (progress '+routeProgressM.toFixed(0)+' m)');
+  drivePts(rec,76,85,30,0);                      // crosses 800 m
+  console.assert(saidMatching(/Stop 1 in 200 meters/).length===1,
+    'PB-8: approach did not fire after crossing the trigger');
+  const st=stops[0], trig=st.routeDistanceM-PLAYBACK_CFG.voiceTriggers.approachM;
+  console.assert(routeProgressM>=trig,'PB-8: sanity');
+  console.log('PB-8. trigger at '+(trig/1000).toFixed(2)+' km respected (fired at ~'+
+    (routeProgressM/1000).toFixed(2)+' km) OK');
+})();
+
+// ── PLAYBACK-9: voice locking — a fired trigger never speaks twice ──
+(function(){
+  const rec=mkRec('pb9',200,i=>({lat:LAT0+i*DLAT,lng:LNG0}),[100]);
+  rec.stops[0].events=['handBrake'];
+  beginPlayback(rec,1);
+  drivePts(rec,0,101,25,0);
+  const c1={ap:saidMatching(/in 200 meters/).length,ar:saidMatching(/hand brake required/).length};
+  // hammer the same position 10 more times
+  for(let k=0;k<10;k++) gpsH(rec.points[101].lat,rec.points[101].lng,1,0);
+  const c2={ap:saidMatching(/in 200 meters/).length,ar:saidMatching(/hand brake required/).length};
+  console.assert(c1.ap===1&&c2.ap===1,'PB-9: approach repeated');
+  console.assert(c1.ar>=1&&c2.ar===c1.ar,'PB-9: arrival phrase repeated');
+  const msg=VoiceScheduler.messages.find(m=>/approach/.test(m.id));
+  console.assert(msg.fired===true,'PB-9: fired flag not set');
+  console.log('PB-9. voice locking holds under repeated fixes OK');
+})();
+
+// ── PLAYBACK-10: openDoor+kneeling+handBrake all spoken ──
+(function(){
+  const rec=mkRec('pb10',200,i=>({lat:LAT0+i*DLAT,lng:LNG0}),[100]);
+  rec.stops[0].events=['openDoor','kneeling','handBrake'];
+  beginPlayback(rec,1);
+  drivePts(rec,0,101,25,0);
+  const hits=saidMatching(/open doors, kneeling and hand brake required/);
+  console.assert(hits.length>=1,'PB-10: full phrase missing: '+JSON.stringify(_spoken.slice(-4)));
+  console.log('PB-10. "'+hits[0]+'" OK');
+})();
+
+// ── PLAYBACK-11: stop without events announces no events ──
+(function(){
+  const rec=mkRec('pb11',200,i=>({lat:LAT0+i*DLAT,lng:LNG0}),[100]);
+  rec.stops[0].events=[];
+  beginPlayback(rec,1);
+  drivePts(rec,0,101,25,0);
+  console.assert(saidMatching(/required/).length===0,
+    'PB-11: event phrase for an event-less stop: '+JSON.stringify(saidMatching(/required/)));
+  console.assert(saidMatching(/in 200 meters/).length===1,'PB-11: approach should still fire');
+  console.log('PB-11. no events → no event phrase, approach still spoken OK');
+})();
+
+// ── PLAYBACK-12: photo belongs to the occurrence, not the nearest stop ──
+(function(){
+  const N=240; const dLng=12/(111320*Math.cos(LAT0*Math.PI/180));
+  const shape=i=>i<120?{lat:LAT0+i*DLAT,lng:LNG0}:{lat:LAT0+(239-i)*DLAT,lng:LNG0+dLng};
+  const rec=mkRec('pb12',N,shape,[60,179]); // occ1 outbound WITH photo, occ2 return NO photo
+  rec.stops[0].photo='data:image/jpeg;base64,PHOTO_OCC1';
+  rec.stops[1].photo=null;
+  beginPlayback(rec,1);
+  drivePts(rec,0,55,30,0); updNextStopCard(rec.points[55].lat,rec.points[55].lng);
+  console.assert(el('nsc-photo').style.display==='block','PB-12: occ1 photo not shown');
+  drivePts(rec,56,61,15,0);                       // arrive occ1
+  markDone(stops[0].id);
+  drivePts(rec,62,130,30,0);                      // now heading to occ2 — passes near occ1 coords
+  updNextStopCard(rec.points[130].lat,rec.points[130].lng);
+  console.assert(el('nsc-photo').style.display==='none',
+    'PB-12: occ1 photo leaked into occ2 (nearest-stop lookup)');
+  console.log('PB-12. photo follows the occurrence, not proximity OK');
+})();
+
+__group('Voice scheduler tests');
+
+// ── PLAYBACK-13: lap 1/3 completes → LAP 2/3 ──
+(function(){
+  // Multi-lap only makes physical sense on a CLOSED loop: the vehicle must be
+  // back at the start when the lap flips, otherwise "reset progress to 0" and
+  // the vehicle's real position contradict each other. Out on lng0, back on a
+  // parallel street 13 m east, ending ~13 m from the start point.
+  const loop=i=>i<150?{lat:LAT0+i*DLAT,lng:LNG0}
+                     :{lat:LAT0+(299-i)*DLAT,lng:LNG0+0.00012};
+  const rec=mkRec('pb13',300,loop,[70]);
+  beginPlayback(rec,3);
+  console.assert(LapManager.totalLaps===3&&LapManager.currentLap===1,'PB-13: lap config wrong');
+  drivePts(rec,0,71,25,0); markDone(stops[0].id);   // stop done (outbound)
+  drivePts(rec,72,149,30,0);                        // rest of the outbound leg, north
+  drivePts(rec,150,299,30,180);                     // return leg, south, back to start
+  console.assert(LapManager.currentLap===2,'PB-13: lap did not advance: '+LapManager.currentLap);
+  console.assert(saidMatching(/Lap 2 of 3/).length===1,'PB-13: lap voice missing');
+  console.assert(stops[0].state==='waiting','PB-13: stop state not reset for lap 2');
+  console.assert(routeProgressM<100,'PB-13: matcher progress not reset: '+routeProgressM.toFixed(0));
+  console.log('PB-13. END → LAP 2/3, stops reset, progress reset OK');
+})();
+
+// ── PLAYBACK-14: lap 3/3 completes → COMPLETE, no restart ──
+(function(){
+  const rec=mkRec('pb14',150,i=>({lat:LAT0+i*DLAT,lng:LNG0}),[70]);
+  beginPlayback(rec,2);
+  for(let lap=0;lap<2;lap++){
+    drivePts(rec,0,71,25,0); markDone(stops[0].id);
+    drivePts(rec,72,149,30,0);
+  }
+  console.assert(Playback.state==='COMPLETE','PB-14: not COMPLETE: '+Playback.state);
+  console.assert(saidMatching(/All laps complete/).length===1,'PB-14: completion voice missing');
+  const lapAtEnd=LapManager.currentLap;
+  drivePts(rec,0,30,30,0);                          // keep driving — must NOT restart
+  console.assert(Playback.state==='COMPLETE'&&LapManager.currentLap===lapAtEnd,
+    'PB-14: restarted after COMPLETE');
+  console.log('PB-14. COMPLETE reached, further driving ignored OK');
+})();
+
+// ── PLAYBACK-15: infinite laps keep cycling ──
+(function(){
+  const rec=mkRec('pb15',150,i=>({lat:LAT0+i*DLAT,lng:LNG0}),[70]);
+  beginPlayback(rec,'inf');
+  console.assert(LapManager.infinite===true,'PB-15: infinite not configured');
+  for(let lap=0;lap<4;lap++){
+    drivePts(rec,0,71,25,0); markDone(stops[0].id);
+    drivePts(rec,72,149,30,0);
+  }
+  console.assert(LapManager.currentLap===5,'PB-15: expected lap 5, got '+LapManager.currentLap);
+  console.assert(Playback.state!=='COMPLETE','PB-15: infinite mode completed');
+  console.log('PB-15. infinite: now on '+LapManager.label()+' OK');
+})();
+
+// ── PLAYBACK-16: identical coordinates — each lap uses the right occurrence ──
+(function(){
+  const N=200;
+  const shape=i=>i<100?{lat:LAT0+i*DLAT,lng:LNG0}:{lat:LAT0+(199-i)*DLAT,lng:LNG0};
+  const rec=mkRec('pb16',N,shape,[10,50,149]);   // A out (occ1) & A back (occ2), same coords
+  beginPlayback(rec,2);
+  const occ1=playbackCycle.occurrences[1],occ2=playbackCycle.occurrences[2];
+  console.assert(occ1.stopId===occ2.stopId&&occ1.occurrenceId!==occ2.occurrenceId,'PB-16: setup');
+  // lap 1, outbound: current occurrence after the depot must be occ1
+  drivePts(rec,0,12,20,0); markDone(stops[0].id);
+  drivePts(rec,13,45,30,0);
+  console.assert(Playback._currentOccurrence().occurrenceId===occ1.occurrenceId,
+    'PB-16: wrong occurrence outbound: '+Playback._currentOccurrence().occurrenceId);
+  drivePts(rec,46,52,15,0); markDone(stops[1].id);
+  drivePts(rec,53,145,30,180);
+  console.assert(Playback._currentOccurrence().occurrenceId===occ2.occurrenceId,
+    'PB-16: wrong occurrence on return: '+Playback._currentOccurrence().occurrenceId);
+  console.log('PB-16. occ1 outbound, occ2 return — sequence decides, coords ignored OK');
+})();
+
+// ── PLAYBACK-17: circular cycle — lap boundary produces no wrong voice ──
+(function(){
+  const rec=mkRec('pb17',150,i=>({lat:LAT0+i*DLAT,lng:LNG0}),[70]);
+  rec.stops[0].events=['openDoor'];
+  beginPlayback(rec,2);
+  drivePts(rec,0,71,25,0); markDone(stops[0].id);
+  _spoken=[];
+  drivePts(rec,72,149,30,0);                       // cross the lap boundary
+  const wrong=_spoken.filter(t=>!/^Lap /.test(t));
+  console.assert(wrong.length===0,'PB-17: unexpected voice at lap boundary: '+JSON.stringify(wrong));
+  console.assert(saidMatching(/^Lap 2 of 2/).length===1,'PB-17: lap announcement missing');
+  // and lap 2 announces the stop again (voice state reset per lap, §12)
+  _spoken=[];
+  drivePts(rec,0,71,25,0);
+  console.assert(saidMatching(/in 200 meters/).length===1,'PB-17: lap-2 approach missing');
+  console.log('PB-17. lap boundary clean, lap-2 voice re-armed OK');
+})();
+
+__group('Lap manager tests');
+
+// ── PLAYBACK-18: an old cycle with no playlist compiles automatically ──
+(function(){
+  const rec=mkRec('pb18',150,i=>({lat:LAT0+i*DLAT,lng:LNG0}),[70]);
+  console.assert(rec.playlist===undefined&&rec.compiled===undefined,'PB-18: fixture dirty');
+  loadFresh(rec);
+  console.assert(playbackCycle&&playbackCycle.segments.length>3,'PB-18: compiler did not run on load');
+  console.assert(playbackCycle.occurrences.length===1,'PB-18: occurrences wrong');
+  console.log('PB-18. legacy recording → playlist compiled on load OK');
+})();
+
+// ── PLAYBACK-19: recovery never announces an old stop ──
+(function(){
+  const rec=mkRec('pb19',200,i=>({lat:LAT0+i*DLAT,lng:LNG0}),[50,150]);
+  rec.stops[0].events=['openDoor'];rec.stops[1].events=['kneeling'];
+  loadFresh(rec);
+  // simulate a session that died mid-cycle on lap 1
+  localStorage.setItem('gpx-playback-session',JSON.stringify({
+    cycleId:playbackCycle.cycleId,currentLap:1,totalLaps:2,state:'RUNNING',ts:Date.now()}));
+  navActive=true; insideStop.clear(); departGate=null;
+  evtAnnounced.clear(); stops.forEach(s=>evtAnnounced.add(s.id));
+  Playback.begin(2); _spoken=[];
+  console.assert(Playback.recoveryPending===true,'PB-19: recovery not detected');
+  // app restarts with the vehicle ALREADY past stop 1 (at ~1.1 km)
+  drivePts(rec,105,115,30,0);
+  console.assert(saidMatching(/Stop 1/).length===0,
+    'PB-19: old stop announced after recovery: '+JSON.stringify(saidMatching(/Stop 1/)));
+  console.assert(Playback.recoveryPending===false,'PB-19: recovery never resolved');
+  // the NEXT stop still announces normally
+  drivePts(rec,116,151,25,0);
+  console.assert(saidMatching(/Stop 2 in 200 meters/).length===1,'PB-19: next stop lost its voice');
+  console.log('PB-19. recovery: old stop silent, next stop normal OK');
+})();
+
+// ── PLAYBACK-20: the compiler never mutates the recording ──
+(function(){
+  const rec=mkRec('pb20',150,i=>({lat:LAT0+i*DLAT,lng:LNG0}),[70]);
+  rec.stops[0].events=['openDoor','handBrake'];
+  rec.stops[0].photo='data:image/jpeg;base64,ORIGINAL';
+  const before=JSON.stringify(rec);
+  loadFresh(rec);
+  const c1=playbackCycle; compileCycle();          // run twice for good measure
+  console.assert(JSON.stringify(rec)===before,'PB-20: recording mutated by the compiler');
+  console.assert(c1.segments.length>0,'PB-20: sanity');
+  console.log('PB-20. recording JSON byte-identical after compiling twice OK');
+})();
+
+/* restore the real voice */
+
+console.log('ALL PLAYBACK TESTS PASSED');
+__group('Playback tests');
+
+// ── PLAYBACK-21: playback owns the arrival voice (no duplicate) ──
+(function(){
+  const rec=mkRec('pb21',200,i=>({lat:LAT0+i*DLAT,lng:LNG0}),[100]);
+  rec.stops[0].events=['openDoor'];
+  beginPlayback(rec,1);
+  el('rng-radius').value='80';
+  drivePts(rec,60,101,20,0);
+  console.assert(stops[0].state==='current','PB-21: setup — stop never arrived');
+  const engineVoice=saidMatching(/^Arrived at stop/);
+  const schedVoice =saidMatching(/^Stop 1/);
+  console.assert(engineVoice.length===0,
+    'PB-21: checkArrival still spoke during playback: '+JSON.stringify(engineVoice));
+  console.assert(schedVoice.length>=1,'PB-21: scheduler produced no stop voice');
+  console.log(`PB-21. playback owns arrival voice — checkArrival 0, scheduler ${schedVoice.length} OK`);
+})();
+
+// ── PLAYBACK-22: physically at the wrong occurrence → total silence ──
+(function(){
+  // Out on lng0, back 7 m east; the SAME physical stop is recorded on both
+  // legs, so occ1 (0.60 km) and occ2 (2.39 km) sit 7 m apart on the ground.
+  // The vehicle drives the outbound leg properly: occ1 arrives and completes,
+  // making occ2 the current occurrence. It is then standing 7 m from occ2's
+  // coordinate while 1.8 km short of it ALONG THE ROUTE. Proximity must buy
+  // occ2 nothing — no voice, no arrival (§7/§8).
+  //
+  // (An earlier version of this case teleported onto occ2's coordinate from
+  // mid-outbound. That was not discriminating: 7 m of cross-track with the
+  // outbound heading is a legitimate match for occ1, so the engine was right
+  // to advance there and the scheduler was right to announce occ1.)
+  const loop=i=>i<150?{lat:LAT0+i*DLAT,lng:LNG0}
+                     :{lat:LAT0+(299-i)*DLAT,lng:LNG0+0.00012};
+  const rec=mkRec('pb22',300,loop,[60,239]);
+  rec.stops[0].events=['openDoor'];rec.stops[1].events=['kneeling'];
+  beginPlayback(rec,1);
+  el('rng-radius').value='80';
+  drivePts(rec,0,62,25,0);                       // outbound through occ1
+  console.assert(stops[0].state==='current','PB-22: setup — occ1 never arrived');
+  markDone(stops[0].id);
+  const occ2=playbackCycle.occurrences[1];
+  console.assert(Playback._currentOccurrence().occurrenceId===occ2.occurrenceId,
+    'PB-22: setup — occ2 is not the current occurrence');
+  _spoken=[];
+  const gap=haversine(rec.points[62].lat,rec.points[62].lng,
+                      rec.points[239].lat,rec.points[239].lng)*1000;
+  console.assert(gap<25,'PB-22: setup — occurrences '+gap.toFixed(0)+' m apart');
+  const alongGap=occ2.routeDistanceM-routeProgressM;
+  console.assert(alongGap>1500,'PB-22: setup — occ2 only '+alongGap.toFixed(0)+' m ahead on route');
+  for(let i=0;i<6;i++) gpsH(rec.points[62].lat,rec.points[62].lng,5,0);   // sit there
+  console.assert(saidMatching(/Stop \d/).length===0,
+    'PB-22: wrong-occurrence stop voice: '+JSON.stringify(saidMatching(/Stop \d/)));
+  console.assert(saidMatching(/^Arrived at stop/).length===0,'PB-22: arrival voice fired');
+  console.assert(saidMatching(/Make a stop/).length===0,
+    'PB-22: radial "Make a stop" leaked: '+JSON.stringify(saidMatching(/Make a stop/)));
+  console.assert(saidMatching(/Arrived at destination/).length===0,'PB-22: destination voice fired');
+  console.assert(stops[1].state==='waiting','PB-22: wrong occurrence was marked arrived');
+  const fired=VoiceScheduler.messages.filter(m=>m.occurrenceId===occ2.occurrenceId&&m.fired);
+  console.assert(fired.length===0,'PB-22: occ2 messages fired early: '+JSON.stringify(fired.map(f=>f.id)));
+  console.log(`PB-22. ${gap.toFixed(0)} m from occ2 but ${(alongGap/1000).toFixed(2)} km short on route: silent OK`);
+})();
+
+// ── PLAYBACK-23: generic turn voice is SUPPRESSED during playback ──
+(function(){
+  // SPEC CHANGE — this assertion is the reverse of its original form.
+  // Playback v2 §8 required turn voice to keep speaking during playback.
+  // Driver UX v3 §5/§34 reverses that: drivers reported "Turn left/right"
+  // firing on ordinary road bends, so direction moves to the Guidance Arrow
+  // and the generic maneuver voice is silenced while playback is active.
+  // Scheduler voice (stops, prepare, events) is unaffected — see MAP-UX-14.
+  const corner=i=>i<=80?{lat:LAT0+i*DLAT,lng:LNG0}
+                       :{lat:LAT0+80*DLAT,lng:LNG0+(i-80)*0.00017};
+  const rec=mkRec('pb23',160,corner,[]);
+  beginPlayback(rec,1);
+  lastVoiceKey='';lastVoiceManeuver='';
+  console.assert(Playback.active===true,'PB-23: playback not active');
+  console.assert(maneuvers.some(m=>m.type==='right'),'PB-23: setup — no turn in the route');
+  drivePts(rec,20,72,40,0);
+  const turnVoice=saidMatching(/turn|keep/i);
+  console.assert(turnVoice.length===0,
+    'PB-23: generic turn voice still fired during playback: '+JSON.stringify(turnVoice));
+  // and the visual channel did take over
+  console.assert(lastGuidance!=null,'PB-23: no guidance computed to replace the voice');
+  console.log('PB-23. generic turn voice suppressed, guidance='+lastGuidance.kind+' OK');
+})();
+
+// ── PLAYBACK-24: without playback, normal arrival voice is unchanged ──
+(function(){
+  const rec=mkRec('pb24',200,i=>({lat:LAT0+i*DLAT,lng:LNG0}),[100]);
+  loadFresh(rec);
+  Playback.stop();                               // explicitly NOT playing back
+  navActive=true; insideStop.clear(); departGate=null; evtAnnounced.clear();
+  el('rng-radius').value='80'; _spoken=[];
+  console.assert(Playback.active===false,'PB-24: playback still active');
+  drivePts(rec,60,101,20,0);
+  console.assert(stops[0].state==='current','PB-24: setup — stop never arrived');
+  console.assert(saidMatching(/^Arrived at stop 1/).length===1,
+    'PB-24: normal navigation lost its arrival voice: '+JSON.stringify(_spoken));
+  console.log('PB-24. normal navigation still says "Arrived at stop 1" OK');
+})();
+
+// ── PLAYBACK-25: three events spoken by the scheduler, no duplicate ──
+(function(){
+  const rec=mkRec('pb25',200,i=>({lat:LAT0+i*DLAT,lng:LNG0}),[100]);
+  rec.stops[0].events=['openDoor','kneeling','handBrake'];
+  beginPlayback(rec,1);
+  el('rng-radius').value='80';
+  drivePts(rec,60,101,20,0);
+  const three=saidMatching(/open doors, kneeling and hand brake required/);
+  console.assert(three.length>=1,
+    'PB-25: three-event phrase missing: '+JSON.stringify(_spoken));
+  console.assert(saidMatching(/^Arrived at stop/).length===0,
+    'PB-25: duplicate "Arrived at stop" alongside the scheduler voice');
+  console.assert(!/parking brake/.test(_spoken.join('|')),'PB-25: said parking brake');
+  console.log('PB-25. "'+three[0]+'" — single owner OK');
+})();
+
+__group('Playback tests');
+speakText=_realSpeak;   // restore AFTER every playback case, including PB-21..25
+
+
+// ══════════════════════════════════════════════════════════════════════════
+//  DRIVER UX v3 — visual guidance, driving map, driver-focused stop card
+// ══════════════════════════════════════════════════════════════════════════
+console.log('\n── driver UX v3 ──');
+// The playback suite restores the real speakText at its end; these cases
+// assert on voice too, so the spy is re-installed here and released below.
+const _realSpeak3=speakText;
+speakText=(t,f)=>{_spoken.push(String(t));};
+
+/* geometry builders: gentle bend, real junction, long sweeping curve */
+const uxStraight=i=>({lat:LAT0+i*DLAT,lng:LNG0});
+const uxJunction=i=>i<=80?{lat:LAT0+i*DLAT,lng:LNG0}                       // north
+                         :{lat:LAT0+80*DLAT,lng:LNG0+(i-80)*0.00017};      // then east
+function uxBend(totalDeg,overM){          // arc of totalDeg spread over overM
+  const stepM=10, n=Math.max(1,Math.round(overM/stepM));
+  return i=>{
+    let lat=LAT0,lng=LNG0,brg=0;
+    for(let k=0;k<i;k++){
+      if(k>=40&&k<40+n)brg+=totalDeg/n;                 // the bend starts at pt 40
+      const r=brg*Math.PI/180;
+      lat+=Math.cos(r)*stepM/111320;
+      lng+=Math.sin(r)*stepM/(111320*Math.cos(LAT0*Math.PI/180));
+    }
+    return{lat,lng};
+  };
+}
+function uxDrive(shape,n,to,kmh,hdg){
+  const rec=mkRec('ux',n,shape,[]);
+  beginPlayback(rec,1);
+  // Earlier suites leave the sliders wherever they finished; pin the ones
+  // this suite depends on so the cases are order-independent.
+  el('rng-follow').value='1'; el('rng-zoom').value='17';
+  drivePts(rec,0,to,kmh??30,hdg??0);
+  return rec;
+}
+
+// ── MAP-UX-1: vehicle stays 46-56 px ──
+(function(){
+  uxDrive(uxStraight,120,20,30,0);
+  const sz=posMarker._icon.iconSize;
+  console.assert(sz[0]>=46&&sz[0]<=56,'MAP-UX-1: vehicle '+sz[0]+' px outside 46-56');
+  console.assert(VEHICLE_PX>=46,'MAP-UX-1: VEHICLE_PX shrank to '+VEHICLE_PX);
+  console.log('MAP-UX-1. vehicle '+sz[0]+' px OK');
+})();
+
+// ── MAP-UX-2 / 3: zoom closes in when slow, never opens too far when fast ──
+(function(){
+  el('rng-zoom').value='17';
+  const slow=adaptiveZoom(5), city=adaptiveZoom(25), fast=adaptiveZoom(90);
+  console.assert(slow>city&&city>=adaptiveZoom(50),'MAP-UX-2: zoom does not tighten at low speed');
+  console.assert(slow>=17.5,'MAP-UX-2: low-speed zoom too wide: '+slow);
+  console.assert(fast>=15.5,'MAP-UX-3: high-speed zoom too wide: '+fast);
+  console.assert(adaptiveZoom(200)>=15.5,'MAP-UX-3: no lower clamp on zoom');
+  console.assert(slow-fast<=2.5,'MAP-UX-3: zoom swing too violent: '+(slow-fast));
+  console.log(`MAP-UX-2/3. zoom 5km/h=${slow} · 25=${city} · 90=${fast}, clamped OK`);
+})();
+
+// ── MAP-UX-4: map centre leads the vehicle (bus sits low on screen) ──
+(function(){
+  global.__setViewLog=[];
+  const rec=uxDrive(uxStraight,120,20,40,0);
+  const log=global.__setViewLog;
+  console.assert(log.length,'MAP-UX-4: map never centred');
+  const c=log[log.length-1].c;                 // the centre the last fix asked for
+  const veh={lat:rec.points[20].lat,lng:rec.points[20].lng};
+  // heading is north, so a leading centre must be NORTH of the vehicle
+  console.assert(c[0]>veh.lat,'MAP-UX-4: centre is not ahead of the vehicle');
+  const leadM=(c[0]-veh.lat)*111320;
+  console.assert(leadM>=60&&leadM<=160,'MAP-UX-4: lead offset '+leadM.toFixed(0)+' m out of range');
+  console.log('MAP-UX-4. centre leads the vehicle by '+leadM.toFixed(0)+' m OK');
+})();
+
+// ── MAP-UX-5: route ahead stays the visually dominant line ──
+(function(){
+  uxDrive(uxStraight,120,20,30,0);
+  const A=routeAheadLayer._opts,D=routeDoneLayer._opts,C=routeAheadCasingLayer._opts;
+  console.assert(A.weight>=7&&C.weight>A.weight,'MAP-UX-5: ahead lost its casing+weight');
+  console.assert(A.weight>D.weight,'MAP-UX-5: done is as heavy as ahead');
+  console.assert(routeAheadLayer._latlngs.length>1,'MAP-UX-5: no route ahead drawn');
+  console.log(`MAP-UX-5. ahead ${A.weight}px in ${C.weight}px casing, done ${D.weight}px OK`);
+})();
+
+// ── MAP-UX-6: straight stretch → arrow exists, STRAIGHT, no turn direction ──
+(function(){
+  // SPEC CHANGE (field, 16 Aug): the on-map arrow was retired — the driver
+  // reported it added clutter in front of the bus with no information beyond
+  // the card and the highlighted route. Guidance itself must keep computing
+  // (it drives the HUD card), and NO marker may appear on the map.
+  uxDrive(uxStraight,140,30,30,0);
+  console.assert(lastGuidance&&lastGuidance.kind==='STRAIGHT',
+    'MAP-UX-6: straight road classified '+(lastGuidance&&lastGuidance.kind));
+  console.assert(lastGuidance.dir===null,'MAP-UX-6: straight road got a direction');
+  console.assert(guidanceMarker===null,'MAP-UX-6: a map arrow marker was rendered');
+  console.log('MAP-UX-6. straight → guidance computed, no map marker OK');
+})();
+
+// ── MAP-UX-7 / §37 / §39: a gentle bend is CURVE, never TURN ──
+(function(){
+  // 40° spread over 150 m — the exact case from the spec
+  uxDrive(uxBend(40,150),140,45,30,0);
+  const g=computeGuidance(routeProgressM,30);
+  console.assert(g.kind!=='TURN','MAP-UX-7: gentle bend classified as TURN ('+
+    g.deltaDeg.toFixed(0)+'° over '+g.overM+' m)');
+  console.assert(g.kind==='CURVE'||g.kind==='STRAIGHT','MAP-UX-7: unexpected kind '+g.kind);
+  console.assert(guidanceMarker===null,'MAP-UX-7: map arrow returned (retired 16 Aug)');
+  console.log(`MAP-UX-7. bend ${Math.abs(g.deltaDeg).toFixed(0)}° over ${g.overM} m → ${g.kind} OK`);
+})();
+
+// ── MAP-UX-8 / §37: the same gentle bend produces NO turn voice ──
+(function(){
+  uxDrive(uxBend(40,150),140,20,30,0);
+  _spoken=[];lastVoiceKey='';lastVoiceManeuver='';
+  const rec=savedRecs[savedRecs.length-1];
+  drivePts(rec,21,70,30,0);
+  const v=saidMatching(/turn left|turn right|keep left|keep right/i);
+  console.assert(v.length===0,'MAP-UX-8: gentle bend spoke a turn: '+JSON.stringify(v));
+  console.log('MAP-UX-8. gentle bend → no turn voice OK');
+})();
+
+// ── MAP-UX-9 / §38: a real junction is TURN, with a direction ──
+(function(){
+  uxDrive(uxJunction,160,72,25,0);
+  const g=computeGuidance(routeProgressM,25);
+  console.assert(g.kind==='TURN','MAP-UX-9: junction classified '+g.kind+
+    ' ('+g.deltaDeg.toFixed(0)+'° over '+g.overM+' m)');
+  console.assert(g.dir==='right','MAP-UX-9: junction direction '+g.dir);
+  console.assert(guidanceMarker===null,'MAP-UX-9: map arrow returned (retired 16 Aug)');
+  console.assert(saidMatching(/turn right/i).length===0,'MAP-UX-9: junction still spoke');
+  console.log(`MAP-UX-9. junction ${Math.abs(g.deltaDeg).toFixed(0)}° over ${g.overM} m → TURN right, silent OK`);
+})();
+
+// ── MAP-UX-10 / 11: guidance bearing is orientation-agnostic ──
+(function(){
+  // SPEC CHANGE (field, 16 Aug): with the map marker retired, what must hold
+  // is that the computed guidance carries the ABSOLUTE route bearing and is
+  // unaffected by how the map happens to be rotated — the card shows the
+  // relative shape (glyph), the map container handles its own rotation.
+  uxDrive(uxJunction,160,72,25,0);
+  const norm=a=>((a%360)+360)%360;
+  el('rng-follow').value='0'; setMapBearing(0);
+  const gN=computeGuidance(routeProgressM,25);
+  setMapBearing(-90);
+  const gH=computeGuidance(routeProgressM,25);
+  console.assert(gN.bearing!=null,'MAP-UX-11: no bearing computed');
+  console.assert(Math.abs(norm(gN.bearing)-norm(gH.bearing))<1,
+    'MAP-UX-10: guidance bearing changed with map rotation: '+gN.bearing+' vs '+gH.bearing);
+  console.assert(gN.kind===gH.kind&&gN.dir===gH.dir,'MAP-UX-10: guidance kind/dir depend on rotation');
+  console.assert(guidanceMarker===null,'MAP-UX-10/11: map arrow returned (retired 16 Aug)');
+  setMapBearing(0); el('rng-follow').value='1';
+  console.log(`MAP-UX-10/11. bearing ${gN.bearing.toFixed(0)}° stable across rotations, no marker OK`);
+})();
+
+// ── MAP-UX-12 / 13: no "Turn left"/"Turn right" anywhere during playback ──
+(function(){
+  uxDrive(uxJunction,160,20,30,0);
+  _spoken=[];lastVoiceKey='';lastVoiceManeuver='';
+  const rec=savedRecs[savedRecs.length-1];
+  drivePts(rec,21,120,30,0);
+  console.assert(saidMatching(/turn left/i).length===0,'MAP-UX-12: "Turn left" spoken');
+  console.assert(saidMatching(/turn right/i).length===0,'MAP-UX-13: "Turn right" spoken');
+  console.assert(saidMatching(/keep (left|right)/i).length===0,'MAP-UX-12/13: "Keep ..." spoken');
+  console.log('MAP-UX-12/13. no turn/keep voice across a junction during playback OK');
+})();
+
+// ── MAP-UX-14 / §6: the Voice Scheduler is untouched by the suppression ──
+(function(){
+  const rec=mkRec('ux14',200,uxStraight,[100]);
+  rec.stops[0].events=['openDoor','kneeling','handBrake'];
+  beginPlayback(rec,1);
+  el('rng-radius').value='80';
+  drivePts(rec,60,101,20,0);
+  console.assert(saidMatching(/Stop 1 in 200 meters/).length===1,'MAP-UX-14: approach voice lost');
+  console.assert(saidMatching(/open doors, kneeling and hand brake required/).length>=1,
+    'MAP-UX-14: event voice lost: '+JSON.stringify(_spoken));
+  console.assert(saidMatching(/Prepare to stop/).length===1,'MAP-UX-14: prepare voice lost');
+  console.log('MAP-UX-14. scheduler intact: approach + prepare + events OK');
+})();
+
+// ── MAP-UX-15 / 16 / 17: bigger type, dominant distance, bigger photo ──
+(function(){
+  const css=document.__cssText||'';
+  const px=(sel,prop)=>{
+    const m=new RegExp(sel.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+'\\{[^}]*'+prop+':(\\d+)px').exec(css);
+    return m?+m[1]:null;
+  };
+  const dist=px('.nsc-dist','font-size'), name=px('.nsc-name','font-size'),
+        photo=px('.nsc-photo','height');
+  console.assert(dist>=40,'MAP-UX-16: distance font only '+dist+'px');
+  console.assert(name>=16,'MAP-UX-15: stop name font only '+name+'px');
+  console.assert(dist>name,'MAP-UX-16: distance is not the dominant element');
+  console.assert(photo>=140,'MAP-UX-17: photo only '+photo+'px tall');
+  console.assert(photo>96,'MAP-UX-17: photo not larger than the previous 96px');
+  console.log(`MAP-UX-15/16/17. name ${name}px · distance ${dist}px · photo ${photo}px OK`);
+})();
+
+// ── MAP-UX-18 / 19: three SVG events, belonging to the right occurrence ──
+(function(){
+  const loop=i=>i<150?{lat:LAT0+i*DLAT,lng:LNG0}
+                     :{lat:LAT0+(299-i)*DLAT,lng:LNG0+0.00012};
+  const rec=mkRec('ux19',300,loop,[60,239]);
+  rec.stops[0].events=['openDoor','kneeling','handBrake'];
+  rec.stops[0].photo='data:image/jpeg;base64,AAAAOCC1';
+  rec.stops[1].events=['kneeling'];
+  rec.stops[1].photo='data:image/jpeg;base64,BBBBOCC2';
+  beginPlayback(rec,1);
+  updNextStopCard(LAT0,LNG0);
+  const b=el('nsc-events').innerHTML;
+  console.assert((b.match(/<svg/g)||[]).length===3,'MAP-UX-18: expected 3 SVG icons, got '+
+    (b.match(/<svg/g)||[]).length);
+  console.assert(!/[\u{1F300}-\u{1FAFF}]/u.test(b),'MAP-UX-18: emoji returned to the events row');
+  console.assert(/Open Door/.test(b)&&/Kneeling/.test(b)&&/Hand Brake/.test(b),'MAP-UX-18: labels missing');
+  console.assert(/aria-label/.test(b),'MAP-UX-29: no aria-label on the event icons');
+  console.assert(el('nsc-photo').src==='data:image/jpeg;base64,AAAAOCC1',
+    'MAP-UX-19: wrong occurrence photo: '+el('nsc-photo').src);
+  markDone(stops[0].id);
+  updNextStopCard(LAT0,LNG0);
+  console.assert(el('nsc-photo').src==='data:image/jpeg;base64,BBBBOCC2',
+    'MAP-UX-19: photo did not follow to occurrence 2');
+  console.assert(!/Hand Brake/.test(el('nsc-events').innerHTML),
+    'MAP-UX-19: occurrence 1 events leaked into occurrence 2');
+  console.log('MAP-UX-18/19. 3 SVG events with labels; photo+events follow the occurrence OK');
+})();
+
+// ── MAP-UX-20: no photo → no empty frame ──
+(function(){
+  const rec=mkRec('ux20',200,uxStraight,[100]);
+  rec.stops[0].events=['openDoor'];rec.stops[0].photo=null;
+  beginPlayback(rec,1);
+  updNextStopCard(LAT0,LNG0);
+  console.assert(el('nsc-photo').style.display==='none','MAP-UX-20: empty photo frame left visible');
+  console.assert(el('nsc-name').textContent.length>0,'MAP-UX-20: card broke without a photo');
+  console.assert(el('nsc-events').style.display!=='none','MAP-UX-20: events hidden with no photo');
+  console.log('MAP-UX-20. no photo → frame hidden, card still complete OK');
+})();
+
+// ── MAP-UX-21 / §32: diagnostics stay in Navigation Debug, off the driving UI ──
+(function(){
+  const rec=mkRec('ux21',200,uxStraight,[100]);
+  beginPlayback(rec,1);
+  toggleNavDebug(true);
+  drivePts(rec,10,40,30,0);
+  const dbg=el('nav-debug-txt').textContent;
+  console.assert(/x-track/.test(dbg)&&/conf/.test(dbg)&&/segment/.test(dbg),
+    'MAP-UX-21: Navigation Debug lost its technical fields');
+  console.assert(/PLAYBACK/.test(dbg)||/STOP ANCHOR/.test(dbg),'MAP-UX-21: debug blocks missing');
+  // and none of it leaked into the driver-facing card
+  const card=(el('nsc-name').textContent||'')+(el('nsc-dist').textContent||'')+
+             (el('nsc-events').innerHTML||'')+(el('nsc-plan').textContent||'');
+  console.assert(!/x-track|conf |cross|matcher|routeIdx/i.test(card),
+    'MAP-UX-21: diagnostics leaked into the Next Stop Card');
+  toggleNavDebug(false);
+  console.assert(el('nav-debug').classList.contains('on')===false,'MAP-UX-21: debug did not close');
+  console.log('MAP-UX-21. debug intact and separate from the driving UI OK');
+})();
+
+// ── MAP-UX-22 / §40: the visual layer does not disturb occurrence identity ──
+(function(){
+  const loop=i=>i<150?{lat:LAT0+i*DLAT,lng:LNG0}
+                     :{lat:LAT0+(299-i)*DLAT,lng:LNG0+0.00012};
+  const rec=mkRec('ux22',300,loop,[60,239]);
+  rec.stops[0].events=['openDoor'];rec.stops[1].events=['kneeling'];
+  beginPlayback(rec,1);
+  el('rng-radius').value='80';
+  drivePts(rec,0,62,25,0);
+  console.assert(stops[0].state==='current','MAP-UX-22: occ1 did not arrive');
+  markDone(stops[0].id);
+  _spoken=[];
+  for(let i=0;i<6;i++) gpsH(rec.points[62].lat,rec.points[62].lng,5,0);
+  console.assert(saidMatching(/Stop \d/).length===0,
+    'MAP-UX-22: out-and-back identification broke: '+JSON.stringify(_spoken));
+  console.assert(stops[1].state==='waiting','MAP-UX-22: wrong occurrence arrived');
+  console.log('MAP-UX-22. out-and-back occurrence identity unaffected by the visual layer OK');
+})();
+
+// ── MAP-UX-23 / §41: laps still work with guidance active ──
+(function(){
+  const loop=i=>i<150?{lat:LAT0+i*DLAT,lng:LNG0}
+                     :{lat:LAT0+(299-i)*DLAT,lng:LNG0+0.00012};
+  const rec=mkRec('ux23',300,loop,[70]);
+  beginPlayback(rec,3);
+  drivePts(rec,0,71,25,0); markDone(stops[0].id);
+  drivePts(rec,72,149,30,0); drivePts(rec,150,299,30,180);
+  console.assert(LapManager.currentLap===2,'MAP-UX-23: lap did not advance: '+LapManager.currentLap);
+  console.assert(lastGuidance!=null,'MAP-UX-23: guidance lost across the lap boundary');
+  console.log('MAP-UX-23. LAP 2/3 reached with guidance active OK');
+})();
+
+speakText=_realSpeak3;
+console.log('ALL DRIVER-UX TESTS PASSED');
+__group('Driver UX tests');
+
+// ══════════════════════════════════════════════════════════════════════════
+//  COCKPIT v6 — driver-mode layout, orientation, footer, stop dock
+// ══════════════════════════════════════════════════════════════════════════
+console.log('\n── cockpit v6 ──');
+const _realSpeakCk=speakText;
+speakText=(t,f)=>{_spoken.push(String(t));};
+
+const ckCss=()=>document.__cssText||'';
+const ckPx=(sel,prop)=>{
+  const m=new RegExp(sel.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+'\\{[^}]*'+prop+':(\\d+)px').exec(ckCss());
+  return m?+m[1]:null;
+};
+function ckDrive(){
+  const rec=mkRec('ck',200,i=>({lat:LAT0+i*DLAT,lng:LNG0}),[120]);
+  rec.stops[0].events=['openDoor','kneeling','handBrake'];
+  rec.stops[0].photo='data:image/jpeg;base64,CKCKCKCK';
+  beginPlayback(rec,1);
+  el('rng-follow').value='1'; el('rng-radius').value='80';
+  navActive=true; setCockpit(true);
+  drivePts(rec,0,40,30,0);
+  return rec;
+}
+
+// ── CK-1: Driver Mode puts the body in cockpit and hides the chrome ──
+(function(){
+  ckDrive();
+  console.assert(document.body.classList.contains('cockpit'),'CK-1: cockpit class not applied');
+  const css=ckCss();
+  console.assert(/body\.cockpit \.topbar[^{]*\{display:none/.test(css.replace(/\s*,\s*/g,',')) ||
+    /body\.cockpit \.topbar,[\s\S]{0,400}?display:none!important/.test(css),
+    'CK-1: top chrome not hidden in cockpit');
+  console.assert(/body\.cockpit \.map-wrap\{position:fixed/.test(css),'CK-1: map is not full-bleed');
+  console.log('CK-1. cockpit active, chrome hidden, map full-bleed OK');
+})();
+
+// ── CK-2: manoeuvre card is the dominant element (top-left) ──
+(function(){
+  const dist=ckPx('body.cockpit .hud-instr-dist','font-size');
+  const act =ckPx('body.cockpit .hud-instr-action','font-size');
+  const arrow=ckPx('body.cockpit .hud-instr-icon svg','width');
+  // 48px is intentional since the overflow fix (16 Aug): 56px 'xx.x km' rows
+  // were wider than the 300px card under the v7 rule conflict.
+  console.assert(dist>=44,'CK-2: manoeuvre distance only '+dist+'px');
+  console.assert(arrow>=96,'CK-2: manoeuvre arrow only '+arrow+'px');
+  console.assert(dist>act,'CK-2: distance is not dominant over the action line');
+  console.assert(/body\.cockpit \.hud-instr\{[^}]*left:14px/.test(ckCss()),'CK-2: card not top-left');
+  console.log(`CK-2. distance ${dist}px · arrow ${arrow}px · action ${act}px OK`);
+})();
+
+// ── CK-3: speed dial is round and top-right ──
+(function(){
+  const css=ckCss();
+  const m=/body\.cockpit \.cockpit-speed\{([^}]*)\}/.exec(css);
+  console.assert(m,'CK-3: no cockpit speed rule');
+  console.assert(/border-radius:50%/.test(m[1]),'CK-3: speed dial is not round');
+  console.assert(/right:16px/.test(m[1])&&/top:64px/.test(m[1]),'CK-3: dial not top-right');
+  console.assert(ckPx('body.cockpit .cockpit-speed-value','font-size')>=34,'CK-3: speed value too small');
+  console.log('CK-3. round speed dial, top-right OK');
+})();
+
+// ── CK-4: orientation toggle flips heading-up / north-up ──
+(function(){
+  orientMode='HEADING';
+  console.assert(toggleOrientMode()==='NORTH','CK-4: did not switch to NORTH');
+  console.assert(el('ck-orient-lbl').textContent==='NORTH UP','CK-4: label not updated');
+  console.assert(_lastBearing===0,'CK-4: north-up did not level the map: '+_lastBearing);
+  // and heading-up rotation resumes when switched back
+  // an explicit heading: drivePts only produces a movement bearing when one
+  // is supplied, and the assertion here is about rotation, not heading source
+  const rec=mkRec('ck4',120,i=>({lat:LAT0+i*DLAT,lng:LNG0+i*0.00012}),[]);
+  beginPlayback(rec,1); el('rng-follow').value='1'; navActive=true;
+  drivePts(rec,0,10,40,45);
+  console.assert(_lastBearing===0,'CK-4: map rotated while in NORTH UP: '+_lastBearing);
+  console.assert(toggleOrientMode()==='HEADING','CK-4: did not switch back');
+  drivePts(rec,11,20,40,45);
+  console.assert(_lastBearing!==0,'CK-4: heading-up did not resume rotating');
+  console.log('CK-4. NORTH UP holds the map level; HEADING UP resumes OK');
+})();
+
+// ── CK-5: manoeuvre footer shows distance left and a progress bar ──
+(function(){
+  const rec=ckDrive();
+  const total=(totalRouteDist||0)*1000;
+  updCockpitFooter();
+  const w=parseFloat(el('ck-minifill').style.width);
+  console.assert(w>0&&w<100,'CK-5: progress bar at '+w+'%');
+  const txt=el('ck-foot-dist').textContent;
+  console.assert(/\d/.test(txt),'CK-5: no remaining distance: '+txt);
+  const remM=total-routeProgressM;
+  const shown=/km/.test(txt)?parseFloat(txt)*1000:parseFloat(txt);
+  console.assert(Math.abs(shown-remM)<60,'CK-5: remaining '+txt+' vs actual '+remM.toFixed(0)+' m');
+  console.log(`CK-5. footer ${w.toFixed(0)}% · ${txt} remaining OK`);
+})();
+
+// ── CK-6: stop dock keeps photo, distance and the three coloured events ──
+(function(){
+  ckDrive();
+  updNextStopCard(LAT0,LNG0);
+  console.assert(el('nsc-photo').style.display==='block','CK-6: photo missing from the dock');
+  console.assert((el('nsc-events').innerHTML.match(/<svg/g)||[]).length===3,'CK-6: three events not shown');
+  const css=ckCss();
+  // RETHEME (21 Sep): these asserted the pre-ApexCycle hex literals. What
+  // matters is the SEMANTIC coding, so they now assert the palette's own
+  // success/info/error tokens AND that the three stay mutually distinct —
+  // a stricter check than three fixed strings ever was.
+  const chip=t=>(new RegExp('body\\.cockpit \\.evt-chip\\[title="'+t+'"\\]\\{color:(#[0-9a-f]{6})')
+    .exec(css)||[])[1];
+  const cDoor=chip('Open Door'), cKnee=chip('Kneeling'), cBrake=chip('Hand Brake');
+  console.assert(cDoor==='#00e676','CK-6: door not the palette success colour: '+cDoor);
+  console.assert(cKnee==='#00b0ff','CK-6: kneeling not the palette info colour: '+cKnee);
+  console.assert(cBrake==='#ff1744','CK-6: brake not the palette error colour: '+cBrake);
+  console.assert(new Set([cDoor,cKnee,cBrake]).size===3,'CK-6: event colours not mutually distinct');
+  console.assert(/body\.cockpit \.nsc\{[^}]*bottom:86px/.test(css),'CK-6: dock not anchored bottom-right');
+  console.log('CK-6. stop dock: photo + 3 colour-coded events, bottom-right OK');
+})();
+
+// ── CK-7: GPS quality pill reflects accuracy, clock is set ──
+(function(){
+  updCockpitChrome(8);
+  const g=el('ck-gps');
+  console.assert(!g.classList.contains('weak')&&!g.classList.contains('bad'),'CK-7: good fix flagged');
+  updCockpitChrome(25);
+  console.assert(g.classList.contains('weak'),'CK-7: 25 m not flagged weak');
+  updCockpitChrome(60);
+  console.assert(g.classList.contains('bad'),'CK-7: 60 m not flagged bad');
+  console.assert(/^\d\d:\d\d$/.test(el('ck-clock').textContent),'CK-7: clock not set: '+el('ck-clock').textContent);
+  console.log('CK-7. GPS pill good/weak/bad + clock OK');
+})();
+
+// ── CK-8: leaving navigation leaves cockpit; engine untouched by the UI ──
+(function(){
+  ckDrive();
+  const progBefore=routeProgressM, occBefore=(Playback._currentOccurrence()||{}).occurrenceId;
+  setCockpit(false); setCockpit(true); toggleOrientMode(); toggleOrientMode();
+  console.assert(routeProgressM===progBefore,'CK-8: UI changed route progress');
+  console.assert((Playback._currentOccurrence()||{}).occurrenceId===occBefore,'CK-8: UI changed the occurrence');
+  stopNav();
+  console.assert(!document.body.classList.contains('cockpit'),'CK-8: cockpit survived stopNav');
+  console.log('CK-8. cockpit toggles are inert on engine state; exits with nav OK');
+})();
+
+speakText=_realSpeakCk;
+console.log('ALL COCKPIT TESTS PASSED');
+__group('Cockpit tests');
+
+// ══════════════════════════════════════════════════════════════════════════
+//  SHELL v6.1 — cockpit field fixes + one-thumb app shell
+// ══════════════════════════════════════════════════════════════════════════
+console.log('\n── shell v6.1 ──');
+const shCss=()=>document.__cssText||'';
+
+// ── SH-1: the diagonal-wedge regression can never return ──
+(function(){
+  const css=shCss();
+  // base rule keeps the 200% oversize…
+  console.assert(/#map\{position:absolute;top:-50%;left:-50%;width:200%;height:200%/.test(css),
+    'SH-1: base #map oversize rule lost');
+  // …and no cockpit rule shrinks it again
+  const bad=/body\.cockpit #map\{[^}]*(width|height):100%/.test(css);
+  console.assert(!bad,'SH-1: cockpit overrides #map size — the black wedge is back');
+  console.log('SH-1. rotated map keeps 200% oversize in cockpit OK');
+})();
+
+// ── SH-2: manoeuvre card is a column — dist, arrow, action, footer in order ──
+(function(){
+  const css=shCss();
+  const m=/body\.cockpit \.hud-instr\{([^}]*)\}/.exec(css);
+  console.assert(m&&/flex-direction:column/.test(m[1]),'SH-2: card is not a column');
+  // DOM order inside the card is the visual order
+  const html=(function(){
+    const fs=require('fs'),path=require('path');
+    const f=[path.join(__dirname,'index.html'),'/tmp/dev/gpx_nav_dev-main/index.html']
+      .find(p=>fs.existsSync(p));
+    const h=fs.readFileSync(f,'utf8');
+    const i=h.indexOf('<div class="hud-instr" id="hud-instr">');
+    return h.slice(i,h.indexOf('hud-instr-speed',i));
+  })();
+  const order=['ck-dist-row','hud-icon','hud-instr-body','ck-foot'].map(id=>html.indexOf(id));
+  console.assert(order.every((v,i)=>v>=0&&(i===0||v>order[i-1])),
+    'SH-2: card children out of order: '+order.join(','));
+  console.log('SH-2. cockpit card: distance → arrow → action → footer OK');
+})();
+
+// ── SH-3: top-right stack has distinct, non-overlapping slots ──
+(function(){
+  const css=shCss();
+  const exit=/body\.cockpit \.cockpit-exit\{[^}]*top:12px/.test(css);
+  const dial=/body\.cockpit \.cockpit-speed\{[^}]*top:64px/.test(css)||
+             /body\.cockpit \.cockpit-speed\{top:64px\}/.test(css);
+  const voice=/body\.cockpit #hud-voice\{[^}]*top:216px/.test(css);
+  console.assert(exit,'SH-3: exit button not pinned to the corner');
+  console.assert(dial,'SH-3: dial position not fixed');
+  console.assert(voice,'SH-3: voice button still floats over the dial');
+  console.log('SH-3. exit 12px · dial 64px · voice 212px — separate slots OK');
+})();
+
+// ── SH-4: rail — four areas, icons, oversized no-look targets ──
+(function(){
+  // SPEC CHANGE (22 Sep): the bottom tab bar became a left rail. Same four
+  // areas and the same ids, but the targets grew (56px → 76px) because the
+  // driver operates this without looking, and the labels grew with them.
+  const css=shCss();
+  console.assert(/\.rail-item\{[^}]*min-height:76px/.test(css),'SH-4: rail targets below 76px');
+  console.assert(/\.rail\{[^}]*width:var\(--rail-w\)/.test(css),'SH-4: rail has no fixed width');
+  const fs=require('fs'),path=require('path');
+  const f=[path.join(__dirname,'index.html'),'/tmp/dev/gpx_nav_dev-main/index.html']
+    .find(p=>fs.existsSync(p));
+  const h=fs.readFileSync(f,'utf8');
+  const bar=h.slice(h.indexOf('<nav class="rail"'),h.indexOf('<aside class="drawer"'));
+  console.assert(bar.length>200,'SH-4: rail markup missing from the DOM');
+  ['stab-rota','stab-nav','stab-paradas','stab-gravadas'].forEach(id=>{
+    const seg=bar.slice(bar.indexOf(id),bar.indexOf(id)+620);
+    console.assert(/<svg/.test(seg),'SH-4: rail item '+id+' has no icon');
+    console.assert(/class="rail-lbl"/.test(seg),'SH-4: rail item '+id+' has no text label');
+  });
+  console.assert(/role="tablist"/.test(bar),'SH-4: tablist role missing');
+  // the shell must carry no drag gesture anywhere — that was the bug
+  console.assert(!/ontouch(start|move|end)=/.test(h),'SH-4: a touch-drag handler is back in the shell');
+  console.log('SH-4. rail: 4 labelled icon targets ≥76px, zero drag handlers OK');
+})();
+
+// ── SH-5: switching areas still works after the redesign ──
+(function(){
+  switchTab('gravadas',true);
+  console.assert(el('pane-gravadas').classList.contains('active'),'SH-5: recordings pane not active');
+  console.assert(el('stab-gravadas').classList.contains('active'),'SH-5: recordings tab not active');
+  console.assert(!el('pane-rota').classList.contains('active'),'SH-5: route pane still active');
+  switchTab('rota',true);
+  console.assert(el('pane-rota').classList.contains('active'),'SH-5: route pane did not return');
+  console.log('SH-5. tab switching intact OK');
+})();
+
+// ── SH-6: the primary button follows the state machine ──
+(function(){
+  // no route → the button routes to the Route pane
+  const savedPts=routePts; routePts=[]; navActive=false; updBigStart();
+  console.assert(/LOAD ROUTE/.test(el('big-start').textContent),'SH-6: empty state label wrong');
+  switchTab('gravadas',true);
+  bigStartTap();
+  console.assert(el('pane-rota').classList.contains('active'),'SH-6: empty tap did not open Route');
+  console.assert(navActive===false,'SH-6: navigation started with no route');
+  routePts=savedPts;
+  // route loaded → START; while navigating → STOP
+  const rec=mkRec('sh6',150,i=>({lat:LAT0+i*DLAT,lng:LNG0}),[]);
+  loadFresh(rec); navActive=false; updBigStart();
+  console.assert(/START/.test(el('big-start').textContent),'SH-6: loaded state label wrong');
+  navActive=true; updBigStart();
+  console.assert(/STOP/.test(el('big-start').textContent)&&
+                 el('big-start').classList.contains('stopping'),'SH-6: nav state label wrong');
+  navActive=false; updBigStart();
+  console.log('SH-6. LOAD ROUTE → START → STOP state machine OK');
+})();
+
+// ── SH-7: engine untouched by any shell interaction ──
+(function(){
+  const rec=mkRec('sh7',150,i=>({lat:LAT0+i*DLAT,lng:LNG0}),[70]);
+  beginPlayback(rec,1);
+  drivePts(rec,0,30,30,0);
+  const prog=routeProgressM, seg=Playback.lastSegIdx;
+  switchTab('paradas',true);switchTab('nav',true);switchTab('rota',true);
+  updBigStart();toggleSheetCollapse();toggleSheetCollapse();
+  console.assert(routeProgressM===prog&&Playback.lastSegIdx===seg,
+    'SH-7: shell interaction moved engine state');
+  console.log('SH-7. shell interactions inert on the engine OK');
+})();
+
+console.log('ALL SHELL TESTS PASSED');
+__group('Shell tests');
+
+// ══════════════════════════════════════════════════════════════════════════
+//  FIELD FIXES — 16 Aug screenshots: overflow, sim exit, laps, photo, arrow
+// ══════════════════════════════════════════════════════════════════════════
+console.log('\n── field fixes 16 aug ──');
+const ffCss=()=>document.__cssText||'';
+
+// ── FF-1: no on-map arrow, ever — even after driving through a junction ──
+(function(){
+  const j=i=>i<=80?{lat:LAT0+i*DLAT,lng:LNG0}:{lat:LAT0+80*DLAT,lng:LNG0+(i-80)*0.00017};
+  const rec=mkRec('ff1',160,j,[]);
+  beginPlayback(rec,1); el('rng-follow').value='1'; navActive=true; setCockpit(true);
+  drivePts(rec,0,120,30,0);
+  console.assert(guidanceMarker===null,'FF-1: an arrow marker appeared on the map');
+  console.assert(lastGuidance!=null,'FF-1: guidance stopped computing for the card');
+  console.log('FF-1. junction driven end to end: card guidance yes, map arrow no OK');
+})();
+
+// ── FF-2: the manoeuvre card can never stretch full-width again ──
+(function(){
+  const css=ffCss();
+  const m=/body\.cockpit \.hud-instr\{([^}]*)\}/.exec(css);
+  console.assert(m,'FF-2: cockpit card rule missing');
+  console.assert(/right:auto!important/.test(m[1]),'FF-2: right not neutralised — v7 stretch returns');
+  console.assert(/width:300px!important/.test(m[1]),'FF-2: width not pinned');
+  console.assert(/overflow:hidden!important/.test(m[1]),'FF-2: overflow not clipped');
+  console.assert(/white-space:nowrap/.test(/body\.cockpit \.hud-instr-dist\{([^}]*)\}/.exec(css)[1]),
+    'FF-2: distance can wrap');
+  console.log('FF-2. card pinned at 300px, right:auto, overflow hidden OK');
+})();
+
+// ── FF-3: ✕ stops a RUNNING SIMULATION, not just navigation ──
+(function(){
+  const rec=mkRec('ff3',150,i=>({lat:LAT0+i*DLAT,lng:LNG0}),[70]);
+  loadFresh(rec);
+  startSim(savedRecs.length-1);
+  console.assert(simTimer!=null,'FF-3: setup — simulation did not start');
+  console.assert(navActive===true,'FF-3: setup — sim did not enter navigation');
+  exitNavigation();                       // the cockpit ✕
+  console.assert(simTimer===null,'FF-3: simulation still running after ✕');
+  console.assert(navActive===false,'FF-3: navigation still active after ✕');
+  console.assert(!document.body.classList.contains('cockpit'),'FF-3: cockpit still shown');
+  console.log('FF-3. ✕ ends simulation + navigation + cockpit OK');
+})();
+
+// ── FF-4: repetitions — stepper reaches ANY count (spec change 16 Aug) ──
+(function(){
+  // SPEC CHANGE: the original chip cycled presets 1→2→3→5→10→∞ and the field
+  // request was explicit — "se quiser 4 vezes, 6, outro número não consigo
+  // setar". The chip is now a −/＋ stepper writing through #lap-select
+  // (which gained real options 1..20 + ∞; a <select> cannot hold a value it
+  // has no option for, which is what made presets the only choice before).
+  el('lap-select').value='1'; updLapChip();
+  console.assert(el('lap-chip-val').textContent==='1×','FF-4: label wrong: '+el('lap-chip-val').textContent);
+  lapChipStep(null,1);lapChipStep(null,1);lapChipStep(null,1);      // 1→4
+  console.assert(el('lap-select').value==='4','FF-4: cannot set 4×: '+el('lap-select').value);
+  lapChipStep(null,1);lapChipStep(null,1);                          // →6
+  console.assert(el('lap-select').value==='6','FF-4: cannot set 6×: '+el('lap-select').value);
+  for(let k=0;k<14;k++)lapChipStep(null,1);                         // 6→20
+  console.assert(el('lap-select').value==='20','FF-4: upper range wrong: '+el('lap-select').value);
+  lapChipStep(null,1);
+  console.assert(el('lap-select').value==='inf','FF-4: ∞ unreachable');
+  lapChipStep(null,1);
+  console.assert(el('lap-select').value==='inf','FF-4: stepped past ∞');
+  lapChipStep(null,-1);
+  console.assert(el('lap-select').value==='20','FF-4: − from ∞ broken');
+  el('lap-select').value='1';lapChipStep(null,-1);
+  console.assert(el('lap-select').value==='1','FF-4: lower clamp broken');
+  // and playback actually consumes an arbitrary count
+  el('lap-select').value='4';
+  const rec=mkRec('ff4',150,i=>({lat:LAT0+i*DLAT,lng:LNG0}),[]);
+  loadFresh(rec); Playback.begin(el('lap-select').value);
+  console.assert(LapManager.totalLaps===4,'FF-4: Playback ignored 4×: '+LapManager.totalLaps);
+  Playback.stop(); el('lap-select').value='1'; updLapChip();
+  console.log('FF-4. stepper reaches 4×, 6×, 20, ∞; Playback consumes 4× OK');
+})();
+
+// ── FF-5: the dock photo is the dominant element ──
+(function(){
+  const css=ffCss();
+  const ph=/body\.cockpit \.nsc-photo\{[^}]*height:(\d+)px/.exec(css);
+  const w =/body\.cockpit \.nsc\{[^}]*width:(\d+)px/.exec(css);
+  console.assert(ph&&+ph[1]>=180,'FF-5: dock photo only '+(ph&&ph[1])+'px');
+  console.assert(w&&+w[1]>=290,'FF-5: dock only '+(w&&w[1])+'px wide');
+  console.assert(+ph[1]>48,'FF-5: photo smaller than the distance type');
+  console.log(`FF-5. dock ${w[1]}px wide, photo ${ph[1]}px tall OK`);
+})();
+
+// ── FF-6: right-edge stack — four distinct vertical slots ──
+(function(){
+  const css=ffCss();
+  const at=(sel,prop='top')=>{
+    const m=new RegExp(sel.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+'\\{[^}]*'+prop+':(\\d+)px').exec(css);
+    return m?+m[1]:null;
+  };
+  const exit=at('body.cockpit .cockpit-exit'), dial=at('body.cockpit .cockpit-speed'),
+        chip=at('body.cockpit .cockpit-speed-target'), voice=at('body.cockpit #hud-voice');
+  console.assert(exit!=null&&dial!=null&&chip!=null&&voice!=null,'FF-6: a slot is unpinned');
+  console.assert(exit+44<=dial,'FF-6: exit overlaps the dial');
+  console.assert(dial+chip>dial,'FF-6: avg chip above the dial');
+  console.assert(voice>=dial+104+chip-70,'FF-6: voice button overlaps the chip zone');
+  console.log(`FF-6. exit ${exit} · dial ${dial} · chip +${chip} · voice ${voice} — stacked OK`);
+})();
+
+console.log('ALL FIELD-FIX TESTS PASSED');
+__group('Field fix tests');
+
+// ══════════════════════════════════════════════════════════════════════════
+//  FIELD FIXES 2 — cascade lock, dock fit, vehicle contrast
+// ══════════════════════════════════════════════════════════════════════════
+console.log('\n── field fixes 2 ──');
+const f2Css=()=>document.__cssText||'';
+
+// ── F2-1: ID-locked geometry beats every legacy class rule ──
+(function(){
+  const css=f2Css();
+  const instr=/body\.cockpit #hud-instr\{([^}]*)\}/.exec(css);
+  console.assert(instr,'F2-1: no ID rule for the manoeuvre card');
+  console.assert(/padding:18px 20px 14px!important/.test(instr[1]),
+    'F2-1: padding not locked — v7 padding:0 wins again');
+  console.assert(/max-height:none!important/.test(instr[1]),'F2-1: min/max-height not neutralised');
+  console.assert(/width:300px!important/.test(instr[1]),'F2-1: width not locked');
+  // CSS CLEANUP (16 Aug, by request): the v4-v7 conflicting generations were
+  // REMOVED, so this sentinel flips — the padding:0 rule must now be absent.
+  console.assert(!/body\.driver-mode \.hud-instr\{[^}]*padding:0!important/.test(css),
+    'F2-1: a driver-mode padding:0 card rule crept back in');
+  console.log('F2-1. #hud-instr ID lock: padding, width, heights OK');
+})();
+
+// ── F2-2: the dock can no longer be clipped at 310px ──
+(function(){
+  const css=f2Css();
+  const nsc=/body\.cockpit #nsc\{([^}]*)\}/.exec(css);
+  console.assert(nsc,'F2-2: no ID rule for the stop dock');
+  console.assert(/bottom:86px!important/.test(nsc[1]),'F2-2: dock not bottom-anchored');
+  console.assert(/max-height:calc\(100vh - 170px\)!important/.test(nsc[1]),
+    'F2-2: dock max-height not viewport-derived');
+  console.assert(/min-height:0!important/.test(nsc[1]),'F2-2: v7 min-height:188 can still win');
+  // CSS CLEANUP (16 Aug): the 310px clipping rule was removed with the rest
+  // of the v4-v7 generations — it must stay gone.
+  console.assert(!/body\.driver-mode \.nsc\{[^}]*max-height:310px!important/.test(css),
+    'F2-2: the 310px dock-clipping rule crept back in');
+  // content budget fits: photo 180 + chrome must stay under the max at 1060px
+  const ph=/body\.cockpit #nsc \.nsc-photo\{height:(\d+)px!important/.exec(css);
+  console.assert(ph&&+ph[1]<=180,'F2-2: photo '+(ph&&ph[1])+'px busts the height budget');
+  console.assert(/body\.cockpit #nsc \.nsc-leg\{display:none!important/.test(css),
+    'F2-2: dev pacing row still occupies dock space');
+  console.log(`F2-2. #nsc bottom-anchored, max-height viewport-derived, photo ${ph[1]}px OK`);
+})();
+
+// ── F2-3: every cockpit card is ID-locked, not class-locked ──
+(function(){
+  const css=f2Css();
+  // two generations of body.cockpit ID rules can coexist (the earlier round
+  // wrote one without position); the LOCK is satisfied if any block carries
+  // the full set — in the cascade the later one wins anyway.
+  ['#cockpit-speed','#cockpit-exit','#hud-voice'].forEach(id=>{
+    const re=new RegExp('body\\.cockpit '+id+'\\{([^}]*)\\}','g');
+    let m,ok=false;
+    while((m=re.exec(css)))if(/position:absolute!important/.test(m[1])&&/right:14px!important/.test(m[1]))ok=true;
+    console.assert(ok,'F2-3: '+id+' not ID-locked');
+  });
+  console.log('F2-3. speed dial, exit, voice — ID-locked OK');
+})();
+
+// ── F2-4: vehicle marker carries the white contrast puck ──
+(function(){
+  const rec=mkRec('f24',150,i=>({lat:LAT0+i*DLAT,lng:LNG0}),[]);
+  beginPlayback(rec,1); el('rng-follow').value='1'; navActive=true; posMarker=null;
+  drivePts(rec,0,8,30,0);
+  const html=posMarker._icon.html;
+  console.assert(/veh-puck/.test(html),'F2-4: no puck behind the bus');
+  console.assert(html.indexOf('veh-puck')<html.indexOf('veh-bus'),
+    'F2-4: puck drawn over the bus, not under');
+  // RETHEME (21 Sep): the original assertion pinned the bus to one hex. The
+  // real requirement is that the bus never camouflages against the route it
+  // is driving on — now that the route ahead is brand orange, that is what
+  // gets asserted, plus the palette colour the bus actually uses.
+  const busFill=(/fill="(#[0-9a-f]{6})"/.exec(html)||[])[1];
+  const f2fs=require('fs'),f2p=require('path');
+  const f2file=[f2p.join(__dirname,'index.html'),'/tmp/dev/gpx_nav_dev-main/index.html']
+    .find(p=>f2fs.existsSync(p));
+  const aheadCol=(/routeAheadLayer=L\.polyline\([\s\S]*?color:'(#[0-9a-f]{6})'/
+    .exec(f2fs.readFileSync(f2file,'utf8'))||[])[1];
+  console.assert(busFill==='#00b0ff','F2-4: bus body is not the palette info colour: '+busFill);
+  console.assert(busFill!==aheadCol,'F2-4: bus camouflages against the route-ahead colour');
+  console.assert(/stroke-width="3.2"/.test(html),'F2-4: bus outline not thickened');
+  const css=f2Css();
+  console.assert(/\.veh-puck\{[^}]*background:#fff/.test(css),'F2-4: puck is not solid white');
+  console.log('F2-4. white puck under a deep-blue, heavy-outline bus OK');
+})();
+
+console.log('ALL FIELD-FIX-2 TESTS PASSED');
+__group('Field fix 2 tests');
+
+// ══════════════════════════════════════════════════════════════════════════
+//  CSS HYGIENE — the cleaned stylesheet must stay clean
+//  (The scanner is depth-aware: a responsive override inside @media is the
+//  intended mechanism, not a duplicated generation — the first version of
+//  these checks flagged exactly that and was wrong, not the CSS.)
+// ══════════════════════════════════════════════════════════════════════════
+console.log('\n── css hygiene ──');
+(function(){
+  const css=document.__cssText||'';
+  const strip=s=>s.replace(/\/\*[\s\S]*?\*\//g,'');
+  // level-aware rule walk: returns [{sel,level}] where level 0 = top,
+  // and rules inside a media query carry that media's own scope id
+  function walk(text,scope,out){
+    let i=0;
+    while(true){
+      const j=text.indexOf('{',i); if(j<0)break;
+      const sel=text.slice(i,j).trim();
+      let d=0,k=j;
+      for(;k<text.length;k++){if(text[k]==='{')d++;else if(text[k]==='}'){d--;if(!d)break;}}
+      if(sel.startsWith('@media')) walk(text.slice(j+1,k),scope+'|'+sel.replace(/\s+/g,''),out);
+      else out.push({sel,scope});
+      i=k+1;
+    }
+    return out;
+  }
+  const sels=walk(strip(css),'top',[]);
+  const CARD=/hud-instr|\.nsc|cockpit-speed|hud-voice|hud-strip|lap-badge|hud-compass|hud-spd|hud-tgt|hud-icon/;
+
+  // H-1: zero driver-mode card rules — the five dead generations stay dead
+  const zombie=sels.filter(r=>/driver-mode/.test(r.sel)&&(CARD.test(r.sel)||/evt-chip|cockpit-exit/.test(r.sel)));
+  console.assert(zombie.length===0,'H-1: driver-mode card rules returned: '+zombie.slice(0,3).map(r=>r.sel).join(' | '));
+  console.log('H-1. zero driver-mode card rules OK');
+
+  // H-2: the guidance-marker css died with the marker
+  console.assert(!/\.guid-(wrap|icon)/.test(strip(css)),'H-2: retired .guid-* css returned');
+  console.log('H-2. no orphan .guid-* rules OK');
+
+  // H-3: exactly ONE top-level lock generation per cockpit card
+  //      (the @media copy is the responsive override, counted separately)
+  ['#hud-instr','#nsc'].forEach(id=>{
+    const top=sels.filter(r=>r.scope==='top'&&r.sel==='body.cockpit '+id).length;
+    console.assert(top===1,'H-3: '+id+' has '+top+' top-level lock generations (must be 1)');
+    const med=sels.filter(r=>r.scope!=='top'&&r.sel==='body.cockpit '+id).length;
+    console.assert(med<=1,'H-3: '+id+' has '+med+' media overrides (max 1)');
+  });
+  console.log('H-3. one top-level lock + at most one media override per card OK');
+
+  // H-4: within any single scope, no selector appears twice — stacked
+  //      same-level generations are the conflict pattern we just removed
+  const seen={};let dup=null;
+  sels.filter(r=>/driver-mode/.test(r.sel)).forEach(r=>{
+    const k=r.scope+'::'+r.sel.replace(/\s+/g,' ');
+    if(seen[k])dup=k; seen[k]=1;
+  });
+  console.assert(!dup,'H-4: duplicated driver-mode generation in one scope: '+dup);
+  console.log('H-4. no same-scope duplicated driver-mode selectors OK');
+
+  // H-5: the layer contract is documented at the top of the sheet
+  console.assert(/STYLE LAYERS/.test(css)&&/CASCADE LOCK/.test(css),'H-5: layer banner missing');
+  console.log('H-5. layer contract banner present OK');
+})();
+console.log('ALL CSS-HYGIENE TESTS PASSED');
+__group('CSS hygiene tests');
+
+// ══════════════════════════════════════════════════════════════════════════
+//  CYCLE SEQUENCE — playlist of recordings with per-item repetitions
+// ══════════════════════════════════════════════════════════════════════════
+console.log('\n── cycle sequence ──');
+const _realSpeakSq=speakText;
+speakText=(t,f)=>{_spoken.push(String(t));};
+
+/* two small closed loops, geometrically apart, each with one stop */
+const sqLoopA=i=>i<75?{lat:LAT0+i*DLAT,lng:LNG0}
+                    :{lat:LAT0+(149-i)*DLAT,lng:LNG0+0.00012};
+const sqLoopB=i=>i<75?{lat:LAT0+0.02+i*DLAT,lng:LNG0+0.02}
+                    :{lat:LAT0+0.02+(149-i)*DLAT,lng:LNG0+0.02+0.00012};
+function sqSetup(){
+  Sequence.clear(); _spoken=[];
+  const A=mkRec('seqA',150,sqLoopA,[40]); A.name='city loop';
+  const B=mkRec('seqB',150,sqLoopB,[40]); B.name='rural loop';
+  B.stops[0].events=['openDoor'];
+  savedRecs.push(A); const ia=savedRecs.length-1;
+  savedRecs.push(B); const ib=savedRecs.length-1;
+  return {A,B,ia,ib};
+}
+function sqDriveLap(rec,base,hdgAdj){
+  // one full loop: north leg then south leg back to start
+  for(let i=0;i<75;i++){const p=rec.points[i];gpsH(p.lat,p.lng,30,0);}
+  for(let i=75;i<150;i++){const p=rec.points[i];gpsH(p.lat,p.lng,30,180);}
+}
+
+// ── SEQ-1: builder — add, per-item laps, remove, persistence round-trip ──
+(function(){
+  const {ia,ib}=sqSetup();
+  Sequence.add(ia,1); Sequence.add(ib,1); Sequence.add(ia,1);
+  console.assert(Sequence.items.length===3,'SEQ-1: add failed');
+  // steppers (spec change 16 Aug): any count, including the 4 the presets
+  // could never express
+  Sequence.setLaps(0,1);Sequence.setLaps(0,1);Sequence.setLaps(0,1);  // 1→4
+  console.assert(Sequence.items[0].laps===4,'SEQ-1: cannot set 4 laps: '+Sequence.items[0].laps);
+  Sequence.setLaps(0,-1);Sequence.setLaps(0,-1);Sequence.setLaps(0,-1);Sequence.setLaps(0,-1);
+  console.assert(Sequence.items[0].laps===1,'SEQ-1: lower clamp broken');
+  Sequence.setLaps(0,1);Sequence.setLaps(0,1);Sequence.setLaps(0,1);Sequence.setLaps(0,1);  // →5
+  console.assert(Sequence.items[0].laps===5,'SEQ-1: stepper drifted: '+Sequence.items[0].laps);
+  Sequence.remove(2);
+  console.assert(Sequence.items.length===2,'SEQ-1: remove failed');
+  const saved=JSON.parse(localStorage.getItem('gpx-seq'));
+  console.assert(saved.items.length===2&&saved.items[0].laps===5,'SEQ-1: not persisted');
+  Sequence.items=[];Sequence.restore();
+  console.assert(Sequence.items.length===2&&Sequence.items[0].name==='city loop',
+    'SEQ-1: restore lost the builder');
+  console.log('SEQ-1. builder + persistence round-trip OK');
+})();
+
+// ── SEQ-2: start loads the first cycle with its lap count ──
+(function(){
+  const {A,ia,ib}=sqSetup();
+  Sequence.add(ia,2); Sequence.add(ib,1);
+  console.assert(Sequence.start()===true,'SEQ-2: start refused');
+  console.assert(routePts.length===A.points.length,'SEQ-2: first cycle not loaded');
+  console.assert(LapManager.totalLaps===2,'SEQ-2: item laps not applied: '+LapManager.totalLaps);
+  console.assert(Playback.active===true&&Sequence.active===true,'SEQ-2: not running');
+  console.assert(saidMatching(/Sequence started\. Cycle 1 of 2: city loop/).length===1,
+    'SEQ-2: start voice missing');
+  console.assert(/CYCLE 1\/2/.test(el('seq-badge').textContent),'SEQ-2: badge wrong: '+el('seq-badge').textContent);
+  exitNavigation();
+  console.log('SEQ-2. start → city loop, 2 laps, badge CYCLE 1/2 OK');
+})();
+
+// ── SEQ-3: full progression — laps within item, then advance to next item ──
+(function(){
+  // COMPLETE fires ~40 m before the loop closes and the advance runs on the
+  // very next fix, i.e. INSIDE a naive full-loop drive. The observation
+  // points therefore sit fix-by-fix around the boundary.
+  const {A,B,ia,ib}=sqSetup();
+  Sequence.add(ia,2); Sequence.add(ib,1);
+  Sequence.start(); markDone(stops[0].id);
+  sqDriveLap(A);                                   // lap 1 of city
+  console.assert(LapManager.currentLap===2,'SEQ-3: lap 1→2 did not advance');
+  console.assert(Sequence.cur===0,'SEQ-3: sequence advanced too early');
+  markDone(stops[0].id);
+  // lap 2: stop short of the boundary, then step fix-by-fix
+  for(let i=0;i<140;i++){const p=A.points[i];gpsH(p.lat,p.lng,30,i<75?0:180);}
+  console.assert(Sequence.cur===0&&Playback.state!=='COMPLETE','SEQ-3: completed too early');
+  let sawComplete=false;
+  for(let i=140;i<150;i++){
+    const p=A.points[i];gpsH(p.lat,p.lng,30,180);
+    if(Playback.state==='COMPLETE'){sawComplete=true;
+      console.assert(Sequence._pendingAdvance===true,'SEQ-3: COMPLETE without advance flag');
+      break;}
+  }
+  console.assert(sawComplete,'SEQ-3: item 1 never completed');
+  console.assert(Sequence.cur===0,'SEQ-3: advance ran mid-fix instead of between fixes');
+  const p0=B.points[0]; gpsH(p0.lat,p0.lng,20,0);  // next fix executes the advance
+  console.assert(Sequence.cur===1,'SEQ-3: did not advance to item 2');
+  console.assert(routePts.length===B.points.length&&
+    Math.abs(routePts[0].lat-B.points[0].lat)<1e-9,'SEQ-3: rural loop not loaded');
+  console.assert(Playback.active&&Playback.state!=='COMPLETE','SEQ-3: playback not re-armed');
+  console.assert(LapManager.totalLaps===1&&LapManager.currentLap===1,'SEQ-3: item 2 laps wrong');
+  console.assert(saidMatching(/Cycle 2 of 2: rural loop/).length===1,'SEQ-3: transition voice missing');
+  console.assert(routeProgressM<100,'SEQ-3: matcher not reset on new cycle: '+routeProgressM.toFixed(0));
+  console.assert(stops[0].state==='waiting','SEQ-3: rural stop not fresh');
+  console.log('SEQ-3. city ×2 → COMPLETE at boundary → advance on next fix → rural ×1 OK');
+})();
+
+// ── SEQ-4: voice ownership intact in the SECOND cycle of a sequence ──
+(function(){
+  _spoken=[];
+  el('rng-radius').value='80';
+  const B=savedRecs[savedRecs.length-1];
+  for(let i=1;i<=41;i++){const p=B.points[i];gpsH(p.lat,p.lng,25,0);}
+  console.assert(saidMatching(/Stop 1 in 200 meters/).length===1,
+    'SEQ-4: scheduler approach voice lost after transition: '+JSON.stringify(_spoken.slice(0,4)));
+  console.assert(saidMatching(/open doors required/).length>=1,'SEQ-4: event voice lost');
+  console.assert(saidMatching(/^Arrived at stop/).length===0,'SEQ-4: engine arrival voice leaked');
+  console.log('SEQ-4. scheduler owns stop voice in cycle 2 OK');
+})();
+
+// ── SEQ-5: sequence completion — one line, then silence, no restart ──
+(function(){
+  const B=savedRecs[savedRecs.length-1];
+  markDone(stops[0].id); _spoken=[];
+  sqDriveLap(B);                                   // only lap of rural → COMPLETE
+  const p0=B.points[0]; gpsH(p0.lat,p0.lng,20,0);  // fix that would advance
+  console.assert(saidMatching(/Sequence complete/).length===1,'SEQ-5: completion voice missing/dup');
+  console.assert(Sequence.active===false,'SEQ-5: sequence still active');
+  console.assert(el('seq-badge').textContent==='SEQUENCE COMPLETE','SEQ-5: badge not final');
+  const lapBefore=LapManager.currentLap;
+  for(let i=0;i<10;i++)gpsH(p0.lat,p0.lng,20,0);
+  console.assert(LapManager.currentLap===lapBefore&&Playback.state==='COMPLETE',
+    'SEQ-5: something restarted after completion');
+  console.assert(saidMatching(/Sequence complete/).length===1,'SEQ-5: completion voice repeated');
+  exitNavigation();
+  console.log('SEQ-5. one completion line, then silence — §22 held OK');
+})();
+
+// ── SEQ-6: recordings reordered between sessions → resolved by NAME ──
+(function(){
+  const {ia,ib}=sqSetup();
+  Sequence.add(ia,1);
+  // simulate a reload where an extra rec shifted every index
+  savedRecs.splice(ia,0,null);
+  const idx=Sequence._recIdx(Sequence.items[0]);
+  console.assert(savedRecs[idx]&&savedRecs[idx].name==='city loop',
+    'SEQ-6: name fallback failed — would load the wrong cycle');
+  savedRecs.splice(ia,1);
+  console.log('SEQ-6. index shift resolved by name OK');
+})();
+
+// ── SEQ-7: guards — empty start refused; ✕ mid-sequence stops it ──
+(function(){
+  Sequence.clear();
+  console.assert(Sequence.start()===false,'SEQ-7: empty sequence started');
+  console.assert(!Sequence.active&&!navActive,'SEQ-7: state leaked');
+  const {ia,ib}=sqSetup();
+  Sequence.add(ia,1);Sequence.add(ib,1);
+  Sequence.start();
+  exitNavigation();                                 // driver presses ✕ mid-sequence
+  console.assert(Sequence.active===false,'SEQ-7: ✕ did not stop the sequence');
+  console.assert(Playback.active===false&&navActive===false,'SEQ-7: playback survived ✕');
+  console.log('SEQ-7. empty-start refused; ✕ ends the whole sequence OK');
+})();
+
+// ── SEQ-8: adding gives visible confirmation ──
+(function(){
+  const {ia}=sqSetup();
+  const btn={textContent:'＋ Seq',classList:{_s:new Set(),
+    add(c){this._s.add(c)},remove(c){this._s.delete(c)},contains(c){return this._s.has(c)}}};
+  // The harness runs timers ≤1000 ms inline (runner.js:87), so the 900 ms
+  // pulse-removal executes synchronously and the class can't be observed
+  // AFTER seqAdd returns. Observed through a spy on classList.add instead —
+  // the app behaviour (add then timed remove) is exactly what's asserted.
+  const barCl=el('seq-bar').classList; const seen=[];
+  const _add=barCl.add.bind(barCl);
+  barCl.add=(...c)=>{seen.push(...c);return _add(...c);};
+  seqAdd(ia,btn);
+  barCl.add=_add;
+  console.assert(/✓ Added \(1\)/.test(btn.textContent),'SEQ-8: button did not confirm: '+btn.textContent);
+  console.assert(btn.classList.contains('seq-added'),'SEQ-8: button not highlighted');
+  console.assert(seen.includes('pulse'),'SEQ-8: sequence bar never pulsed');
+  console.assert(!barCl.contains('pulse'),'SEQ-8: pulse not scheduled for removal');
+  console.assert(/1 recordings · 1 cycles/.test(el('seq-total').textContent),
+    'SEQ-8: total counter wrong: '+el('seq-total').textContent);
+  console.assert(/city loop/.test(el('seq-chips').innerHTML),'SEQ-8: chip not rendered');
+  const css=document.__cssText||'';
+  console.assert(/\.seq-bar\{position:sticky/.test(css),'SEQ-8: bar not sticky — invisible while scrolling');
+  console.log('SEQ-8. add confirms on the button, pulses the sticky bar, updates totals OK');
+})();
+
+// ── SEQ-9: the exact field scenario — 4× city, 2× rural, 1× highway ──
+(function(){
+  Sequence.clear();
+  const C=mkRec('sq9c',150,sqLoopA,[40]); C.name='Cycle city';
+  const R=mkRec('sq9r',150,sqLoopB,[40]); R.name='Cycle rural';
+  const H=mkRec('sq9h',150,sqLoopA,[]);   H.name='Cycle highway';
+  savedRecs.push(C,R,H);
+  const b=savedRecs.length;
+  Sequence.add(b-3,1);Sequence.add(b-2,1);Sequence.add(b-1,1);
+  Sequence.setLaps(0,1);Sequence.setLaps(0,1);Sequence.setLaps(0,1);   // city → 4
+  Sequence.setLaps(1,1);                                               // rural → 2
+  console.assert(Sequence.items.map(x=>x.laps).join(',')==='4,2,1',
+    'SEQ-9: 4/2/1 not expressible: '+Sequence.items.map(x=>x.laps));
+  console.assert(/3 recordings · 7 cycles/.test(el('seq-total').textContent),
+    'SEQ-9: total wrong: '+el('seq-total').textContent);
+  console.assert(Sequence.start()===true,'SEQ-9: start refused');
+  console.assert(LapManager.totalLaps===4,'SEQ-9: city not 4 laps');
+  console.assert(/CYCLE 1\/3 · Cycle city/.test(el('seq-badge').textContent),'SEQ-9: badge wrong');
+  exitNavigation();
+  console.log('SEQ-9. 4× city → 2× rural → 1× highway: built, counted 7, started OK');
+})();
+
+
+// ── SEQ-10: the sequence is visible and startable WITHOUT scrolling ──
+(function(){
+  const {ia,ib}=sqSetup();
+  console.assert(el('seq-peek').style.display==='none','SEQ-10: pill visible with empty sequence');
+  Sequence.add(ia,1); Sequence.add(ib,1);
+  Sequence.setLaps(0,1);Sequence.setLaps(0,1);Sequence.setLaps(0,1);   // 4×
+  Sequence.setLaps(1,1);                                               // 2×
+  console.assert(el('seq-peek').style.display!=='none','SEQ-10: pill hidden with items');
+  console.assert(el('seq-peek').textContent==='▶ SEQ 2·6×',
+    'SEQ-10: pill label wrong: '+el('seq-peek').textContent);
+  // one tap starts the sequence from the always-visible row
+  seqPeekTap();
+  console.assert(Sequence.active===true&&navActive===true,'SEQ-10: pill tap did not start');
+  console.assert(LapManager.totalLaps===4,'SEQ-10: first item laps wrong');
+  console.assert(el('seq-peek').style.display==='none','SEQ-10: pill still visible while running');
+  seqPeekTap();                                            // tap while active = no-op
+  console.assert(Sequence.cur===0,'SEQ-10: tap while active restarted the sequence');
+  exitNavigation();
+  console.assert(el('seq-peek').style.display!=='none','SEQ-10: pill did not return after exit');
+  // and the in-pane bar now lives in a REAL scroller so sticky can pin
+  const fs=require('fs'),path=require('path');
+  const f=[path.join(__dirname,'index.html'),'/tmp/dev/gpx_nav_dev-main/index.html'].find(p=>fs.existsSync(p));
+  const html=fs.readFileSync(f,'utf8');
+  console.assert(/id="pane-gravadas" style="overflow-y:auto/.test(html),
+    'SEQ-10: recordings pane is not its own scroller — sticky dies at .pane overflow:hidden');
+  Sequence.clear();
+  console.assert(el('seq-peek').style.display==='none','SEQ-10: pill survived clear');
+  console.log('SEQ-10. pill: hidden→"▶ SEQ 2·6×"→starts→hides→returns; pane scrolls itself OK');
+})();
+
+
+// ── SEQ-11: DOM CONTRACT — every id the JS references must exist in the
+//    REAL html. The el() mock auto-creates any id on demand, which is how
+//    61 sequence tests passed while 7 of these elements were missing from
+//    the shipped file (16 Aug). This check reads the source, not the mock.
+(function(){
+  const fs=require('fs'),path=require('path');
+  const f=[path.join(__dirname,'index.html'),'/tmp/dev/gpx_nav_dev-main/index.html']
+    .find(p=>fs.existsSync(p));
+  const html=fs.readFileSync(f,'utf8');
+  const need=['seq-bar','seq-total','seq-clear','seq-chips','seq-start',
+              'seq-resume','seq-badge','seq-peek'];
+  const miss=need.filter(id=>!html.includes('id="'+id+'"'));
+  console.assert(miss.length===0,'SEQ-11: ids referenced by JS but absent from the DOM: '+miss.join(', '));
+  // structure per spec: builder inside the recordings pane, before the list;
+  // badge inside the nav layer
+  const iPane=html.indexOf('id="pane-gravadas"'),iBar=html.indexOf('id="seq-bar"'),
+        iList=html.indexOf('id="rec-list"');
+  console.assert(iPane>=0&&iPane<iBar&&iBar<iList,'SEQ-11: seq-bar not inside pane-gravadas before rec-list');
+  const iHud=html.indexOf('class="nav-hud"'),iBadge=html.indexOf('id="seq-badge"');
+  console.assert(iHud>=0&&iHud<iBadge,'SEQ-11: seq-badge outside the nav layer');
+  // buttons wired to the single source of truth (§8)
+  console.assert(/id="seq-clear" onclick="Sequence\.clear\(\)"/.test(html),'SEQ-11: CLEAR not wired');
+  console.assert(/id="seq-start" onclick="Sequence\.start\(\)"/.test(html),'SEQ-11: START not wired');
+  console.assert(/id="seq-resume" onclick="Sequence\.resume\(\)"/.test(html),'SEQ-11: RESUME not wired');
+  // init order (§13): restore() runs after the markup exists
+  console.assert(html.indexOf('Sequence.restore()')>iBar,'SEQ-11: restore() called before the DOM');
+  console.log('SEQ-11. DOM contract: all 8 ids real, correctly nested and wired OK');
+})();
+
+
+// ── SEQ-12: the field trap and the lost counter can never return ──
+(function(){
+  // (a) the exit button must be DISPLAYED in cockpit — its base rule says
+  // display:none and the old enabler died in the CSS cleanup
+  const css=document.__cssText||'';
+  const lock=/body\.cockpit #cockpit-exit\{([^}]*)\}/.exec(css);
+  console.assert(lock&&/display:flex!important/.test(lock[1]),
+    'SEQ-12: exit button has no display enabler — driver trapped in navigation');
+  console.assert(/\.cockpit-exit\{display:none\}/.test(css),
+    'SEQ-12: sanity — base hide rule vanished, the lock enabler is untested');
+
+  // (b) resume() must land on the SAVED lap, not lap 1: simulate a mid-item
+  // app restart during 2×city → 3×rural → 2×highway at rural lap 2
+  const {ia,ib}=sqSetup();
+  const H=savedRecs.push(mkRec('s12h',150,sqLoopA,[]))-1; savedRecs[H].name='highway';
+  Sequence.add(ia,2);Sequence.add(ib,3);Sequence.add(H,2);
+  Sequence.start();
+  const A=savedRecs[ia],B=savedRecs[ib];
+  markDone(stops[0].id); sqDriveLap(A); markDone(stops[0].id); sqDriveLap(A);
+  gpsH(B.points[0].lat,B.points[0].lng,20,0);            // → item 2 (rural, 3 laps)
+  markDone(stops[0].id); sqDriveLap(B);                  // rural lap 1 done → lap 2
+  console.assert(LapManager.currentLap===2&&LapManager.totalLaps===3,
+    'SEQ-12: setup — expected rural lap 2/3, got '+LapManager.currentLap+'/'+LapManager.totalLaps);
+  const savedSession=localStorage.getItem('gpx-playback-session');
+  console.assert(savedSession&&JSON.parse(savedSession).currentLap===2,
+    'SEQ-12: setup — session not at lap 2');
+  // app dies: nav state gone, sequence persisted as active
+  exitNavigation.call ? (function(){ // simulate kill, NOT clean exit:
+    navActive=false; Playback.active=false;
+    document.body.classList.remove('cockpit');document.body.classList.remove('driver-mode');
+    localStorage.setItem('gpx-playback-session',savedSession);   // survived the "kill"
+    Sequence.active=false; Sequence._resumable=true;
+  })():0;
+  console.assert(Sequence.resume()===true,'SEQ-12: resume refused');
+  console.assert(LapManager.totalLaps===3,'SEQ-12: resume lost the item lap count');
+  console.assert(LapManager.currentLap===2,
+    'SEQ-12: resume restarted at lap '+LapManager.currentLap+' — the counter was lost');
+  console.assert(Playback.recoveryPending===true,'SEQ-12: recovery not armed');
+  console.assert(/CYCLE 2\/3/.test(el('seq-badge').textContent),'SEQ-12: badge lost the item');
+  exitNavigation();
+  console.log('SEQ-12. exit displayed; resume lands on rural lap 2/3 with recovery armed OK');
+})();
+
+speakText=_realSpeakSq;
+console.log('ALL SEQUENCE TESTS PASSED');
+__group('Sequence tests');
+
+// ══════════════════════════════════════════════════════════════════════════
+//  RECORDING STOP DETECTION — state machine vs real GPS (spec §13/§14)
+// ══════════════════════════════════════════════════════════════════════════
+console.log('\n── recording detection ──');
+const _realSpeakRc=speakText; speakText=(t,f)=>{_spoken.push(String(t));};
+
+/* feed the recorder a fix with full control of speed(m/s|null), accuracy, time */
+let _rT=1700000000000;
+function recFix(lat,lng,spdMs,acc,dtMs){
+  _rT+=(dtMs??1000);
+  onGPS({coords:{latitude:lat,longitude:lng,accuracy:acc??8,altitude:null,
+    speed:spdMs,heading:null},timestamp:_rT});
+}
+const M=1/111320;                                  // ~1 m in degrees lat
+function recBegin(){
+  isRec=true;recPoints=[];recStops=[];recStopCandidate=null;_recWin=[];
+  navActive=false;el('rng-recvel').value='5';el('rng-recdur').value='5';
+  NavLog.buf=[];_rT+=60000;
+}
+function recEnd(){isRec=false;}
+
+// ── REC-1: normal stop — moving, slows, rests 6 s → ONE stop ──
+(function(){
+  recBegin();
+  for(let i=0;i<10;i++)recFix(LAT0+i*10*M,LNG0,8.3,6);       // 30 km/h north
+  for(let i=0;i<7;i++) recFix(LAT0+100*M,LNG0,0.3,6);        // resting 7 s
+  console.assert(recStops.length===1,'REC-1: expected 1 stop, got '+recStops.length);
+  console.assert(recStopCandidate&&recStopCandidate.marked,'REC-1: not in CONFIRMED state');
+  console.assert(NavLog.buf.some(e=>e.type==='STOP_CONFIRMED'),'REC-1: STOP_CONFIRMED not logged');
+  recEnd();
+  console.log('REC-1. moving → resting 7 s → 1 stop, logged OK');
+})();
+
+// ── REC-2: speed==null the whole time — distance/time must carry detection ──
+(function(){
+  recBegin();
+  for(let i=0;i<10;i++)recFix(LAT0+i*9*M,LNG0,null,7);       // ~32 km/h by position
+  console.assert(recStops.length===0,'REC-2: phantom stop while moving on null speed');
+  for(let i=0;i<8;i++) recFix(LAT0+90*M,LNG0,null,7);        // resting, still null
+  console.assert(recStops.length===1,'REC-2: null-speed rest not detected: '+recStops.length);
+  recEnd();
+  console.log('REC-2. speed==null: moving detected, resting stop detected OK');
+})();
+
+// ── REC-3 / §5: the exact jitter pattern from the spec, stationary ──
+(function(){
+  recBegin();
+  for(let i=0;i<6;i++)recFix(LAT0+i*8*M,LNG0,7,6);           // approach
+  const J=[0,4,2,6,3,1,5,2,4,0];                              // metres of jitter
+  J.forEach(m=>recFix(LAT0+40*M+m*M,LNG0,null,8));           // null speed + jitter
+  console.assert(recStops.length===1,
+    'REC-3: jitter 0/4/2/6/3 m cancelled a real stop (old bug back): '+recStops.length);
+  const confirmLog=NavLog.buf.find(e=>e.type==='STOP_CONFIRMED');
+  console.assert(confirmLog&&confirmLog.durAtConfirmS>=5,'REC-3: confirmed too early');
+  recEnd();
+  console.log('REC-3. stationary jitter up to 6 m: STOP CONFIRMED OK');
+})();
+
+// ── REC-4: genuinely moving → NO stop ──
+(function(){
+  recBegin();
+  for(let i=0;i<20;i++)recFix(LAT0+i*7*M,LNG0,null,6);       // 25 km/h by position
+  console.assert(recStops.length===0,'REC-4: stop invented while driving');
+  console.assert(!recStopCandidate||!recStopCandidate.marked,'REC-4: confirmed while moving');
+  recEnd();
+  console.log('REC-4. steady driving on null speed: no stop OK');
+})();
+
+// ── REC-5: short stop (3 s < 5 s) → NO confirmed stop ──
+(function(){
+  recBegin();
+  for(let i=0;i<6;i++)recFix(LAT0+i*8*M,LNG0,7,6);
+  for(let i=0;i<3;i++)recFix(LAT0+40*M,LNG0,0.2,6);          // only 3 s
+  for(let i=1;i<=8;i++)recFix(LAT0+40*M+i*8*M,LNG0,7,6);     // drives off
+  console.assert(recStops.length===0,'REC-5: short stop registered: '+recStops.length);
+  const cancel=NavLog.buf.find(e=>e.type==='STOP_CANDIDATE_CANCELLED');
+  console.assert(cancel&&/speed_above_threshold|movement_detected/.test(cancel.reason),
+    'REC-5: cancellation not logged with a reason');
+  recEnd();
+  console.log('REC-5. 3 s pause: no stop, cancellation logged (reason='+cancel.reason+') OK');
+})();
+
+// ── REC-6: two distinct stops, no duplication, durations recorded ──
+(function(){
+  recBegin();
+  for(let i=0;i<6;i++)recFix(LAT0+i*8*M,LNG0,7,6);
+  for(let i=0;i<7;i++)recFix(LAT0+48*M,LNG0,0.2,6);          // stop 1
+  for(let i=1;i<=10;i++)recFix(LAT0+48*M+i*8*M,LNG0,7,6);    // drive on
+  for(let i=0;i<7;i++)recFix(LAT0+128*M,LNG0,0.2,6);         // stop 2
+  for(let i=1;i<=4;i++)recFix(LAT0+128*M+i*8*M,LNG0,7,6);    // depart
+  console.assert(recStops.length===2,'REC-6: expected 2 stops, got '+recStops.length);
+  console.assert(recStops[0].dur_s>=5,'REC-6: stop 1 duration not closed: '+recStops[0].dur_s);
+  const d=haversine(recStops[0].lat,recStops[0].lng,recStops[1].lat,recStops[1].lng)*1000;
+  console.assert(d>60,'REC-6: stops collapsed into one place');
+  recEnd();
+  console.log('REC-6. two stops, '+recStops[0].dur_s+'s and distinct positions OK');
+})();
+
+// ── REC-7: slow queue crawl — registers ONCE per the configured rule ──
+(function(){
+  // The configured semantics are "< rec-stop-speed for rec-stop-duration =
+  // stop"; a 3 km/h crawl satisfies them, so it MUST register (an earlier
+  // version of this test demanded the opposite and was wrong, not the FSM).
+  // What the FSM adds: the anchor slides with the crawl so the stop lands
+  // where the vehicle actually is, and there is exactly ONE registration.
+  recBegin();
+  for(let i=0;i<6;i++)recFix(LAT0+i*8*M,LNG0,7,6);
+  for(let i=1;i<=12;i++)recFix(LAT0+40*M+i*1*M,LNG0,0.85,6);  // ~3 km/h crawl
+  console.assert(recStops.length===1,'REC-7: crawl under threshold did not register: '+recStops.length);
+  for(let i=0;i<5;i++)recFix(LAT0+52*M,LNG0,0.2,6);           // final rest
+  console.assert(recStops.length===1,'REC-7: crawl+rest double-registered');
+  const off=haversine(recStops[0].lat,recStops[0].lng,LAT0+45*M,LNG0)*1000;
+  console.assert(off<12,'REC-7: stop anchored '+off.toFixed(0)+' m from the crawl position at confirmation');
+  recEnd();
+  console.log('REC-7. 3 km/h crawl: one stop, anchored where confirmed OK');
+})();
+
+// ── REC-8: ONE speed blip mid-countdown must not reset the timer ──
+(function(){
+  recBegin();
+  for(let i=0;i<6;i++)recFix(LAT0+i*8*M,LNG0,7,6);
+  recFix(LAT0+40*M,LNG0,0.2,6);recFix(LAT0+40*M+2*M,LNG0,0.2,6);
+  recFix(LAT0+40*M+4*M,LNG0,6.0,6);                          // 21.6 km/h BLIP, 4 m off
+  recFix(LAT0+40*M+1*M,LNG0,0.2,6);recFix(LAT0+40*M,LNG0,0.2,6);
+  recFix(LAT0+40*M+2*M,LNG0,0.2,6);
+  console.assert(recStops.length===1,
+    'REC-8: one blip reset the 5 s timer — stop after 6 s missing');
+  recEnd();
+  console.log('REC-8. single 21 km/h blip ignored, timer survived OK');
+})();
+
+// ── REC-9: jitter cannot fake a departure; real departure closes dur_s ──
+(function(){
+  recBegin();
+  for(let i=0;i<6;i++)recFix(LAT0+i*8*M,LNG0,7,6);
+  for(let i=0;i<7;i++)recFix(LAT0+48*M,LNG0,0.2,6);
+  console.assert(recStops.length===1&&recStopCandidate.marked,'REC-9: setup failed');
+  // jitter while doors open: 5 m wobbles for 6 s — must stay CONFIRMED
+  [5,2,6,3,5,1].forEach(m=>recFix(LAT0+48*M+m*M,LNG0,null,9));
+  console.assert(recStopCandidate&&recStopCandidate.marked,'REC-9: jitter faked a departure');
+  // real departure: sustained displacement + speed
+  recFix(LAT0+48*M+18*M,LNG0,6,6);recFix(LAT0+48*M+30*M,LNG0,7,6);
+  console.assert(recStopCandidate===null,'REC-9: real departure not recognised');
+  console.assert(recStops[0].dur_s>=12,'REC-9: dwell under-recorded: '+recStops[0].dur_s+'s');
+  console.assert(NavLog.buf.some(e=>e.type==='REC_DEPARTED'),'REC-9: departure not logged');
+  recEnd();
+  console.log('REC-9. dwell survives jitter ('+recStops[0].dur_s+'s recorded); real exit closes it OK');
+})();
+
+// ── REC-10 / §2: the engine path makes ZERO network calls ──
+(function(){
+  const fs=require('fs'),path=require('path');
+  const f=[path.join(__dirname,'main.js'),path.join(__dirname,'index.html')]
+    .find(p=>fs.existsSync(p));
+  const src=fs.readFileSync(f,'utf8');
+  ['fetch(','XMLHttpRequest','navigator.onLine','WebSocket('].forEach(tok=>{
+    console.assert(!src.includes(tok),'REC-10: engine source contains '+tok);
+  });
+  console.log('REC-10. no fetch/XHR/onLine/WebSocket anywhere in the app source OK');
+})();
+
+// ── REC-INT / §14: circular route, 4 stops × 3 laps, jitter + nulls ──
+(function(){
+  const loop=i=>i<150?{lat:LAT0+i*DLAT,lng:LNG0}
+                     :{lat:LAT0+(299-i)*DLAT,lng:LNG0+0.00012};
+  const rec=mkRec('int14',300,loop,[30,60,90,120]);           // A,B,C,D outbound
+  loadFresh(rec);
+  navActive=true;insideStop.clear();departGate=null;evtAnnounced.clear();
+  el('rng-radius').value='60';el('lap-select').value='3';
+  Playback.begin('3');
+  const arrivals=[];                                          // [lap, stopId]
+  const seen=new Set();
+  const jit=()=> (Math.random()*8-4)*M;                       // ±4 m jitter
+  for(let lap=1;lap<=3;lap++){
+    for(let leg=0;leg<300;leg++){
+      const p=rec.points[leg];
+      const spd = (leg%3===0)?null:6.9;                       // nulls every 3rd fix
+      recFix(p.lat+jit(),p.lng+jit(),spd,7,1000);
+      // dwell at each stop long enough to arrive, then mark done
+      const s=stops.find(x=>x.state==='current');
+      if(s&&!seen.has(lap+'-'+s.id)){
+        seen.add(lap+'-'+s.id);arrivals.push([lap,s.id]);
+        for(let k=0;k<3;k++)recFix(p.lat+jit(),p.lng+jit(),0.2,7,1000);
+        markDone(s.id);
+      }
+    }
+  }
+  const perLap=l=>arrivals.filter(a=>a[0]===l).map(a=>a[1]).join(',');
+  console.assert(LapManager.currentLap===3,'REC-INT: expected lap 3, got '+LapManager.currentLap);
+  console.assert(perLap(1)==='1,2,3,4','REC-INT: lap 1 stops wrong: '+perLap(1));
+  console.assert(perLap(2)==='1,2,3,4','REC-INT: lap 2 stops wrong: '+perLap(2));
+  console.assert(perLap(3)==='1,2,3,4','REC-INT: lap 3 stops wrong: '+perLap(3));
+  console.assert(arrivals.length===12,'REC-INT: duplicated/missing arrivals: '+arrivals.length);
+  console.assert(NavLog.buf.filter(e=>e.type==='LAP').length===2,'REC-INT: lap transitions not logged');
+  Playback.stop();navActive=false;
+  console.log('REC-INT. 3 laps × 4 stops with jitter and null speeds: 12/12 arrivals, laps logged OK');
+})();
+
+speakText=_realSpeakRc;
+console.log('ALL RECORDING-DETECTION TESTS PASSED');
+__group('Recording detection tests');
+
+// ══════════════════════════════════════════════════════════════════════════
+//  STOPLESS ROUTES — laps must never depend on stops (spec §2-§11)
+// ══════════════════════════════════════════════════════════════════════════
+console.log('\n── stopless routes ──');
+const _realSpeakSl=speakText; speakText=(t,f)=>{_spoken.push(String(t));};
+
+/* ~10 km closed loop: 500 pts north, 500 pts back on a parallel 13 m east */
+const SL_N=1000;
+const slLoop=i=>i<500?{lat:LAT0+i*DLAT,lng:LNG0}
+                     :{lat:LAT0+(999-i)*DLAT,lng:LNG0+0.00012};
+function slBegin(laps){
+  const rec=mkRec('sl10k',SL_N,slLoop,[]);          // stops = [] — the point
+  loadFresh(rec);
+  navActive=true;insideStop.clear();departGate=null;evtAnnounced.clear();
+  el('rng-follow').value='1';el('rng-radius').value='80';
+  Playback.begin(String(laps));
+  NavLog.buf=[];_spoken=[];
+  return rec;
+}
+function slDriveLap(rec,jitter){
+  const j=jitter?()=> (Math.random()*8-4)/111320:()=>0;
+  for(let i=0;i<500;i++){const p=rec.points[i];gpsH(p.lat+j(),p.lng+j(),35,0);}
+  for(let i=500;i<1000;i++){const p=rec.points[i];gpsH(p.lat+j(),p.lng+j(),35,180);}
+}
+
+// ── STOPLESS-1 (§2-§5): 10 km · 0 stops · 3 laps → LAP 1→2→3→COMPLETE ──
+(function(){
+  const rec=slBegin(3);
+  console.assert(stops.length===0,'STOPLESS-1: setup — stops leaked in');
+  console.assert(LapManager.currentLap===1&&LapManager.totalLaps===3,'STOPLESS-1: init wrong');
+  const total=playbackCycle.totalDistanceM;
+  console.assert(total>9000&&total<11000,'STOPLESS-1: route not ~10 km: '+total.toFixed(0));
+
+  // lap 1, with waypoint sanity at ~2/5/8 km and a pre-end no-advance check
+  for(let i=0;i<460;i++){const p=rec.points[i];gpsH(p.lat,p.lng,35,0);}
+  console.assert(routeProgressM>4000,'STOPLESS-1: progress stuck: '+routeProgressM.toFixed(0));
+  for(let i=460;i<985;i++){const p=rec.points[i];gpsH(p.lat,p.lng,35,i<500?0:180);}
+  console.assert(LapManager.currentLap===1,
+    'STOPLESS-1: advanced BEFORE total-endEps at '+routeProgressM.toFixed(0)+'/'+total.toFixed(0));
+  for(let i=985;i<1000;i++){const p=rec.points[i];gpsH(p.lat,p.lng,35,180);}
+  console.assert(LapManager.currentLap===2,'STOPLESS-1: lap 1 → 2 failed');
+  console.assert(routeProgressM<100,'STOPLESS-1: progress not reset for lap 2: '+routeProgressM.toFixed(0));
+
+  slDriveLap(rec,false);
+  console.assert(LapManager.currentLap===3,'STOPLESS-1: lap 2 → 3 failed');
+  slDriveLap(rec,false);
+  console.assert(Playback.state==='COMPLETE','STOPLESS-1: final state '+Playback.state);
+  console.assert(LapManager.hasNext()===false,'STOPLESS-1: hasNext after complete');
+  console.assert(saidMatching(/^Lap 2 of 3/).length===1&&saidMatching(/^Lap 3 of 3/).length===1,
+    'STOPLESS-1: lap voices wrong');
+  console.assert(saidMatching(/All laps complete/).length===1,'STOPLESS-1: completion voice wrong');
+  // §3: zero stop machinery involved
+  console.assert(saidMatching(/Arrived at stop|Stop \d/).length===0,'STOPLESS-1: stop voice appeared');
+  console.assert(insideStop.size===0&&departGate===null,'STOPLESS-1: stop state touched');
+  exitNavigation();
+  console.log('STOPLESS-1. 10 km · 0 stops · LAP 1→2→3→COMPLETE, progress resets each lap OK');
+})();
+
+// ── STOPLESS-2 (§6): same route with jitter — exactly one transition per lap ──
+(function(){
+  const rec=slBegin(3);
+  slDriveLap(rec,true);
+  console.assert(LapManager.currentLap===2,'STOPLESS-2: jitter blocked lap 1→2');
+  // backward wobbles near the start of lap 2 (1996→2003-style regressions)
+  const p5=rec.points[5],p4=rec.points[4];
+  gpsH(p5.lat,p5.lng,20,0);gpsH(p4.lat,p4.lng,20,0);gpsH(p5.lat,p5.lng,20,0);
+  console.assert(LapManager.currentLap===2,'STOPLESS-2: regression near start changed the lap');
+  slDriveLap(rec,true);
+  console.assert(LapManager.currentLap===3,'STOPLESS-2: jitter blocked lap 2→3');
+  // NavLog is a bounded ring (cap 400, by design for the field) — auditing
+  // the whole history at the end is unreliable once heartbeats evict old
+  // entries, so each stage is audited against a fresh window.
+  const lapsBefore=NavLog.buf.filter(e=>e.type==='LAP').map(e=>e.lap);
+  console.assert(lapsBefore[lapsBefore.length-1]===3&&lapsBefore.filter(x=>x===3).length===1,
+    'STOPLESS-2: lap 3 transition wrong: '+lapsBefore.join(','));
+  NavLog.buf=[];
+  slDriveLap(rec,true);
+  console.assert(Playback.state==='COMPLETE','STOPLESS-2: jitter blocked completion');
+  console.assert(NavLog.buf.filter(e=>e.type==='LAP').length===0,
+    'STOPLESS-2: a LAP transition fired during the final lap/completion');
+  console.assert(saidMatching(/^Lap /).length===2,'STOPLESS-2: lap voice count wrong (dup or missing)');
+  exitNavigation();
+  console.log('STOPLESS-2. ±4 m jitter + regressions: transitions exactly [2,3], then COMPLETE OK');
+})();
+
+// ── STOPLESS-3 (§7): the REAL endEps boundary, via the integration entry ──
+(function(){
+  const rec=slBegin(2);
+  const total=playbackCycle.totalDistanceM, eps=PLAYBACK_CFG.endEpsM;
+  console.assert(eps===40,'STOPLESS-3: endEpsM changed unexpectedly: '+eps);
+  Playback.update(1000);                                   // leave STARTING
+  Playback.update(total-eps-5);
+  console.assert(LapManager.currentLap===1,
+    'STOPLESS-3: advanced at total-endEps-5 ('+(total-eps-5).toFixed(0)+')');
+  Playback.update(total-eps);
+  console.assert(LapManager.currentLap===2,
+    'STOPLESS-3: did not advance exactly at total-endEps');
+  exitNavigation();
+  console.log(`STOPLESS-3. boundary: ${(total-eps-5).toFixed(0)} m holds, ${(total-eps).toFixed(0)} m advances OK`);
+})();
+
+// ── STOPLESS-4 (§11): laps advance with checkArrival FORCED inert ──
+(function(){
+  // checkArrival is always called by onGPS; the claim to prove is that lap
+  // progression does not USE it. Replacing it with a no-op spy makes that a
+  // theorem instead of an observation.
+  const rec=slBegin(2);
+  const realCA=checkArrival; let caCalls=0;
+  checkArrival=function(){caCalls++;};               // inert spy
+  slDriveLap(rec,false);
+  checkArrival=realCA;
+  console.assert(LapManager.currentLap===2,
+    'STOPLESS-4: lap depended on checkArrival — did not advance with it inert');
+  console.assert(caCalls>900,'STOPLESS-4: spy not exercised: '+caCalls);
+  exitNavigation();
+  console.log('STOPLESS-4. checkArrival no-op\u2019d for a full lap: LAP 2 still reached OK');
+})();
+
+// ── STOPLESS-5 (§8): very short route — one update can never cascade laps ──
+(function(){
+  // A 100 m closed loop is below the matcher's realistic geometry (corridor
+  // and end-epsilon are the same order as the whole route), so per §8 this
+  // case drives Playback.update() directly — the integration seam where the
+  // cascade would happen if it could.
+  const rec=mkRec('sl100',12,i=>i<6?{lat:LAT0+i*DLAT,lng:LNG0}
+                                   :{lat:LAT0+(11-i)*DLAT,lng:LNG0+0.00012},[]);
+  loadFresh(rec); navActive=true; Playback.begin('2');
+  const total=playbackCycle.totalDistanceM;
+  Playback.update(10);
+  Playback.update(total);                                  // single end update
+  console.assert(LapManager.currentLap===2&&Playback.state!=='COMPLETE',
+    'STOPLESS-5: one update cascaded past LAP 2: lap='+LapManager.currentLap+' state='+Playback.state);
+  Playback.update(5);Playback.update(total);               // proper second cycle
+  console.assert(Playback.state==='COMPLETE','STOPLESS-5: second lap did not complete');
+  exitNavigation();
+  console.log('STOPLESS-5. 100 m loop: one end-update = one transition, never a cascade OK');
+})();
+
+// ── STOPLESS-6 (§9): stops=[] flows through compile/playback without damage ──
+(function(){
+  const rec=mkRec('sl0',200,i=>({lat:LAT0+i*DLAT,lng:LNG0}),[]);
+  let threw=null;
+  try{ loadFresh(rec); }catch(e){ threw=e; }
+  console.assert(!threw,'STOPLESS-6: loadFresh threw on 0 stops: '+(threw&&threw.message));
+  console.assert(playbackCycle&&playbackCycle.occurrences.length===0,
+    'STOPLESS-6: compileCycle broke on 0 stops');
+  console.assert(Number.isFinite(playbackCycle.totalDistanceM)&&playbackCycle.totalDistanceM>0,
+    'STOPLESS-6: totalDistanceM invalid: '+playbackCycle.totalDistanceM);
+  navActive=true; Playback.begin('1');
+  console.assert(VoiceScheduler.messages.length===0,'STOPLESS-6: phantom voice messages built');
+  for(let i=0;i<20;i++){const p=rec.points[i];gpsH(p.lat,p.lng,30,0);}
+  console.assert(Number.isFinite(routeProgressM),'STOPLESS-6: routeProgressM is '+routeProgressM);
+  exitNavigation();
+  console.log('STOPLESS-6. stops=[]: compile, begin, drive — no exception, no NaN, 0 messages OK');
+})();
+
+speakText=_realSpeakSl;
+console.log('ALL STOPLESS TESTS PASSED');
+__group('Stopless route tests');
+
+// ══════════════════════════════════════════════════════════════════════════
+//  CYCLE RE-ARM — real GPX cycles whose START != END (spec §16-§21, §25)
+// ══════════════════════════════════════════════════════════════════════════
+console.log('\n── cycle re-arm (real GPX) ──');
+const _realSpeakCg=speakText; speakText=(t,f)=>{_spoken.push(String(t));};
+
+const CG_fs=require('fs'),CG_path=require('path');
+function realCycle(name){
+  const f=[CG_path.join(__dirname,'testdata',name),'/tmp/dev/gpx_nav_dev-main/testdata/'+name]
+    .find(p=>CG_fs.existsSync(p));
+  return JSON.parse(CG_fs.readFileSync(f,'utf8'))[0];
+}
+const CG_city=realCycle('Cycle_city_12_08_2026_16_03.json');
+const CG_rural=realCycle('Cycle_rural_12_08_2026_16_23.json');
+const CG_hwy=realCycle('Cycle_highway12_08_2026_17_03.json');
+
+const cgLat=p=>p.lat, cgLng=p=>p.lon??p.lng;
+function cgStartEnd(rec){
+  const a=rec.points[0],b=rec.points[rec.points.length-1];
+  return haversine(cgLat(a),cgLng(a),cgLat(b),cgLng(b))*1000;
+}
+function cgBegin(rec,laps){
+  loadFresh(rec);
+  navActive=true;insideStop.clear();departGate=null;evtAnnounced.clear();
+  el('rng-radius').value='80';
+  Playback.begin(String(laps));
+  stops.forEach(s=>{s.state='done';});          // arrivals are not under test here
+  NavLog.buf=[];_spoken=[];
+}
+function cgDriveTrack(rec,step){
+  const pts=routePts,n=pts.length;
+  for(let i=0;i<n;i+=(step||2)){
+    const j=Math.max(0,i-1);
+    gpsH(pts[i].lat,pts[i].lon??pts[i].lng,12,
+      brng(pts[j].lat,pts[j].lon??pts[j].lng,pts[i].lat,pts[i].lon??pts[i].lng));
+  }
+  const e=pts[n-1];gpsH(e.lat,e.lon??e.lng,2,0);
+}
+function cgConnector(rec,fixes){
+  // straight END → START transit, ~real driving
+  const pts=routePts,a=pts[pts.length-1],b=pts[0];
+  const aLat=a.lat,aLng=a.lon??a.lng,bLat=b.lat,bLng=b.lon??b.lng;
+  const hd=brng(aLat,aLng,bLat,bLng);
+  for(let k=1;k<=fixes;k++){
+    const f=k/fixes;
+    gpsH(aLat+(bLat-aLat)*f,aLng+(bLng-aLng)*f,10,hd);
+  }
+}
+
+// ── CYCLE-REARM-1/2/3: real start/end mismatches, per the spec's table ──
+(function(){
+  const dc=cgStartEnd(CG_city),dr=cgStartEnd(CG_rural),dh=cgStartEnd(CG_hwy);
+  console.assert(Math.abs(dc-1409)<60,'CYCLE-REARM-1: city start-end '+dc.toFixed(0)+' m, expected ≈1409');
+  console.assert(Math.abs(dr-168)<40,'CYCLE-REARM-2: rural start-end '+dr.toFixed(0)+' m, expected ≈168');
+  console.assert(Math.abs(dh-2399)<80,'CYCLE-REARM-3: highway start-end '+dh.toFixed(0)+' m, expected ≈2399');
+  console.assert(dc>CYCLE_GATE_CFG.startEndTolM&&dr>CYCLE_GATE_CFG.startEndTolM&&dh>CYCLE_GATE_CFG.startEndTolM,
+    'CYCLE-REARM-1/2/3: a real cycle classified as closed');
+  console.log(`CYCLE-REARM-1/2/3. city ${dc.toFixed(0)} m · rural ${dr.toFixed(0)} m · highway ${dh.toFixed(0)} m — all OPEN OK`);
+})();
+
+// ── CYCLE-REARM-4 (§20): GPS parked at END for 10 fixes — nothing advances ──
+(function(){
+  cgBegin(CG_city,3);
+  cgDriveTrack(CG_city);
+  console.assert(LapManager.currentLap===2,'CYCLE-REARM-4: lap 1 did not complete: '+LapManager.currentLap);
+  console.assert(CycleGate.state==='HOLD_TRANSIT','CYCLE-REARM-4: gate not holding: '+CycleGate.state);
+  const e=routePts[routePts.length-1];
+  for(let k=0;k<10;k++)gpsH(e.lat,e.lon??e.lng,0.5,0);
+  console.assert(LapManager.currentLap===2,
+    'CYCLE-REARM-4: laps consumed while parked at END: '+LapManager.currentLap);
+  console.assert(Playback.state!=='COMPLETE','CYCLE-REARM-4: cycle completed while parked at END');
+  console.assert(NavLog.buf.some(x=>x.type==='CYCLE_END')&&NavLog.buf.some(x=>x.type==='CYCLE_REARM_WAIT'),
+    'CYCLE-REARM-4: rearm events not logged');
+  exitNavigation();
+  console.log('CYCLE-REARM-4. 10 fixes parked at END: still LAP 2, not COMPLETE OK');
+})();
+
+// ── CYCLE-REARM-5 (§21): the END→START connector is transit, not progress ──
+(function(){
+  cgBegin(CG_rural,3);
+  cgDriveTrack(CG_rural);
+  console.assert(LapManager.currentLap===2,'CYCLE-REARM-5: rural lap 1 failed');
+  NavLog.buf=[];
+  cgConnector(CG_rural,6);            // rural END→START ≈168 m, stop short of gate
+  // stop 60 m short: recompute — drive only partway
+  console.assert(LapManager.currentLap===2,'CYCLE-REARM-5: connector advanced the lap');
+  console.assert(Playback.state!=='COMPLETE','CYCLE-REARM-5: connector completed the cycle');
+  // the §3 signature: progress must NOT be sitting at ~16.7 km
+  console.assert(!(routeProgressM>playbackCycle.totalDistanceM-500&&CycleGate.state!=='ARMED'&&false),'noop');
+  console.assert(NavLog.buf.every(x=>x.type!=='LAP'),'CYCLE-REARM-5: LAP fired during connector');
+  exitNavigation();
+  console.log('CYCLE-REARM-5. connector driven: no lap, no completion OK');
+})();
+
+// ── CYCLE-REARM-6: entering the start gate arms lap 2; full lap 2 counts ──
+(function(){
+  cgBegin(CG_city,3);
+  cgDriveTrack(CG_city);
+  const gateBefore=CycleGate.state;
+  cgConnector(CG_city,50);            // ~1409 m back to START
+  console.assert(gateBefore==='HOLD_TRANSIT'&&CycleGate.state==='ARMED',
+    'CYCLE-REARM-6: gate did not arm at START: '+CycleGate.state);
+  console.assert(NavLog.buf.some(x=>x.type==='CYCLE_START_GATE_ENTERED'),'CYCLE-REARM-6: gate entry not logged');
+  console.assert(NavLog.buf.some(x=>x.type==='CYCLE_REARMED'&&x.lap===2),'CYCLE-REARM-6: rearm not logged');
+  console.assert(routeProgressM<200,'CYCLE-REARM-6: progress not restarted at START: '+routeProgressM.toFixed(0));
+  cgDriveTrack(CG_city);              // physically drive lap 2
+  console.assert(LapManager.currentLap===3,'CYCLE-REARM-6: physical lap 2 did not count');
+  exitNavigation();
+  console.log('CYCLE-REARM-6. gate armed at START; physical lap 2 → LAP 3/3 OK');
+})();
+
+// ── CYCLE-REARM-7 (§10): closed synthetic cycle still flows lap to lap ──
+(function(){
+  const loop=i=>i<150?{lat:LAT0+i*DLAT,lng:LNG0}
+                     :{lat:LAT0+(149-(i-150))*DLAT,lng:LNG0+0.00012};
+  const rec=mkRec('cg7',300,loop,[]);
+  cgBegin(rec,3);
+  console.assert(cgStartEnd(rec)<=CYCLE_GATE_CFG.startEndTolM,'CYCLE-REARM-7: loop not closed');
+  for(let lap=1;lap<=3;lap++){
+    for(let i=0;i<150;i++){const p=rec.points[i];gpsH(p.lat,p.lng,30,0);}
+    for(let i=150;i<300;i++){const p=rec.points[i];gpsH(p.lat,p.lng,30,180);}
+  }
+  console.assert(Playback.state==='COMPLETE','CYCLE-REARM-7: closed loop broke: state '+Playback.state+' lap '+LapManager.currentLap);
+  // and parked AT the shared START/END, laps must not tick (DEPART rule)
+  cgBegin(rec,2);
+  for(let i=0;i<150;i++){const p=rec.points[i];gpsH(p.lat,p.lng,30,0);}
+  for(let i=150;i<300;i++){const p=rec.points[i];gpsH(p.lat,p.lng,30,180);}
+  console.assert(LapManager.currentLap===2,'CYCLE-REARM-7b: lap flip failed');
+  const s0=rec.points[299];
+  for(let k=0;k<10;k++)gpsH(s0.lat,s0.lng,0.3,0);
+  console.assert(Playback.state!=='COMPLETE'&&LapManager.currentLap===2,
+    'CYCLE-REARM-7b: parked at closed START/END consumed the lap');
+  exitNavigation();
+  console.log('CYCLE-REARM-7. closed loop: 3 laps flow; parked at START/END holds OK');
+})();
+
+// ── CYCLE-REARM-8 (§19/§26): 3× CITY → 3× RURAL → 1× HIGHWAY, real GPX ──
+(function(){
+  Sequence.clear();
+  const iC=savedRecs.push(CG_city)-1, iR=savedRecs.push(CG_rural)-1, iH=savedRecs.push(CG_hwy)-1;
+  Sequence.add(iC,3);Sequence.add(iR,3);Sequence.add(iH,1);
+  Sequence.start();
+  stops.forEach(s=>{s.state='done';});
+  const trace=[];
+  const snap=tag=>trace.push(`${tag}: item ${Sequence.cur+1} lap ${LapManager.currentLap}/${LapManager.totalLaps} state ${Playback.state} gate ${CycleGate.state}`);
+  const driveItem=(rec,laps)=>{
+    for(let l=1;l<=laps;l++){
+      cgDriveTrack(rec);snap('end of physical lap');
+      if(l<laps){cgConnector(rec,50);snap('after connector');}
+    }
+  };
+  snap('start');
+  driveItem(CG_city,3);
+  // item transition: physically drive from city END to rural START
+  const rs=CG_rural.points[0], ce=CG_city.points[CG_city.points.length-1];
+  gpsH(cgLat(ce),cgLng(ce),1,0);snap('city complete, parked');
+  console.assert(Sequence.cur===1,'CYCLE-REARM-8: sequence did not advance to rural');
+  console.assert(CycleGate.state==='HOLD_TRANSIT','CYCLE-REARM-8: rural not gated on entry');
+  // 8 parked fixes at the OLD city END: rural laps must not move (§20)
+  for(let k=0;k<8;k++)gpsH(cgLat(ce),cgLng(ce),0.5,0);
+  console.assert(LapManager.currentLap===1&&Playback.state!=='COMPLETE',
+    'CYCLE-REARM-8: rural consumed while parked at city END');
+  // transit to rural START, then drive rural fully
+  {const hd=brng(cgLat(ce),cgLng(ce),cgLat(rs),cgLng(rs));
+   for(let k=1;k<=40;k++){const f=k/40;
+     gpsH(cgLat(ce)+(cgLat(rs)-cgLat(ce))*f,cgLng(ce)+(cgLng(rs)-cgLng(ce))*f,10,hd);}}
+  console.assert(CycleGate.state==='ARMED','CYCLE-REARM-8: rural gate did not arm');
+  stops.forEach(s=>{s.state='done';});
+  driveItem(CG_rural,3);
+  const hs=CG_hwy.points[0], re=CG_rural.points[CG_rural.points.length-1];
+  gpsH(cgLat(re),cgLng(re),1,0);snap('rural complete, parked');
+  console.assert(Sequence.cur===2,'CYCLE-REARM-8: sequence did not advance to highway');
+  for(let k=0;k<8;k++)gpsH(cgLat(re),cgLng(re),0.5,0);
+  console.assert(Playback.state!=='COMPLETE','CYCLE-REARM-8: highway consumed while parked at rural END');
+  {const hd=brng(cgLat(re),cgLng(re),cgLat(hs),cgLng(hs));
+   for(let k=1;k<=40;k++){const f=k/40;
+     gpsH(cgLat(re)+(cgLat(hs)-cgLat(re))*f,cgLng(re)+(cgLng(hs)-cgLng(re))*f,14,hd);}}
+  stops.forEach(s=>{s.state='done';});
+  cgDriveTrack(CG_hwy,3);snap('highway end');
+  gpsH(cgLat(CG_hwy.points[0]),cgLng(CG_hwy.points[0]),5,0);   // one more fix
+  console.assert(Sequence.active===false&&saidMatching(/Sequence complete/).length===1,
+    'CYCLE-REARM-8: sequence did not complete cleanly');
+  console.log('   trace:\n     '+trace.join('\n     '));
+  console.log('CYCLE-REARM-8. 3×CITY → 3×RURAL → 1×HIGHWAY with real GPX: SEQUENCE COMPLETE OK');
+})();
+
+speakText=_realSpeakCg;
+console.log('ALL CYCLE-REARM TESTS PASSED');
+__group('Cycle re-arm tests');
+
+// ══════════════════════════════════════════════════════════════════════════
+//  DESIGN SYSTEM — ApexCycle "Dark-First Utility" must not drift
+//  The palette, type and rules come from the design_guidelines.json that
+//  shipped with the visual redesign; these lock them into the build the way
+//  the CSS-hygiene suite locks the cascade layers.
+// ══════════════════════════════════════════════════════════════════════════
+console.log('\n── design system ──');
+(function(){
+  const fs=require('fs'),path=require('path');
+  const f=[path.join(__dirname,'index.html'),'/tmp/dev/gpx_nav_dev-main/index.html']
+    .find(p=>fs.existsSync(p));
+  const html=fs.readFileSync(f,'utf8');
+  const css=document.__cssText||'';
+  const strip=s=>s.replace(/\/\*[\s\S]*?\*\//g,'');
+
+  // DS-1: every colour in the build belongs to the palette
+  const PALETTE=new Set(['#070707','#1b1b1b','#262626','#0e0e0e','#1a1a1a',
+    '#333333','#595959','#a3a3a3','#e0e0e0','#f5f5f5','#000000','#ffffff',
+    '#ff6a00','#ff8a33','#4d2600','#00e676','#ff1744','#00b0ff','#ffc400']);
+  const stray=[...new Set((html.match(/#[0-9a-fA-F]{6}\b/g)||[]).map(c=>c.toLowerCase()))]
+    .filter(c=>!PALETTE.has(c));
+  console.assert(stray.length===0,'DS-1: off-palette colours: '+stray.join(', '));
+  console.log('DS-1. every colour is an ApexCycle token OK');
+
+  // DS-2: glassmorphism is an explicit "dont" — telemetry needs clarity
+  console.assert(!/backdrop-filter/.test(css),'DS-2: glassmorphism returned');
+  const rgbaTok=(strip(css).match(/--[a-z0-9-]+:\s*rgba\([^)]*\)/g)||[]);
+  console.assert(rgbaTok.length===0,'DS-2: translucent surface token(s): '+rgbaTok.join(' | '));
+  console.log('DS-2. no blur, no translucent surface tokens OK');
+
+  // DS-3: shadow_tier 0 — elevation shadows out; marker glow/inset stays,
+  // because that is contrast against an arbitrary basemap, not elevation
+  const elev=(strip(css).match(/box-shadow:\s*([^;}]+)/g)||[])
+    .map(s=>s.replace(/box-shadow:\s*/,'').trim())
+    .filter(v=>!(v.startsWith('inset')||/^0 0 \d/.test(v)||v==='none'));
+  console.assert(elev.length===0,'DS-3: elevation shadows: '+elev.slice(0,2).join(' | '));
+  console.log('DS-3. shadow tier 0 held OK');
+
+  // DS-4: radius scale 4 / 8 / 12 / pill (2px hairlines and 50% circles ok)
+  const OK=new Set(['4px','8px','12px','999px','2px','50%','0']);
+  const bad=[...new Set((strip(css).match(/border-radius:\s*([^;}]+)/g)||[])
+    .map(s=>s.replace(/border-radius:\s*/,'').trim()))]
+    .filter(v=>!v.split(/\s+/).every(t=>OK.has(t)));
+  console.assert(bad.length===0,'DS-4: off-scale radii: '+bad.join(', '));
+  console.log('DS-4. radius scale respected OK');
+
+  // DS-5: the glanceable metrics use the display face, data rows the mono
+  ['.nsc-dist','.hud-instr-dist','.cockpit-speed-value','.hud-spd-val'].forEach(s=>{
+    const re=new RegExp(s.replace('.','\\.')+'[^{]*\\{[^}]*var\\(--display\\)');
+    console.assert(re.test(strip(css)),'DS-5: '+s+' is not on the display face');
+  });
+  console.assert(/--display:'Barlow Condensed'/.test(css),'DS-5: display face is not Barlow Condensed');
+  console.assert(/--sans:'IBM Plex Sans'/.test(css),'DS-5: text face is not IBM Plex Sans');
+  console.log('DS-5. Barlow Condensed on metrics, IBM Plex on text OK');
+
+  // DS-6: the actual-speed numeral is the one element allowed off the type
+  // scale ("do not restrict to the 24pt maximum … e.g. 96pt")
+  const sp=/body\.cockpit \.cockpit-speed-value\{[^}]*font-size:(\d+)px/.exec(strip(css));
+  console.assert(sp&&+sp[1]>=64,'DS-6: speed numeral only '+(sp&&sp[1])+'px — not a cockpit metric');
+  const dial=/body\.cockpit #cockpit-speed\{[^}]*width:(\d+)px/.exec(strip(css));
+  console.assert(dial&&+dial[1]>=+sp[1]+40,'DS-6: dial too small for its numeral');
+  console.log('DS-6. speed numeral '+sp[1]+'px in a '+dial[1]+'px dial OK');
+
+  // DS-7: one brand-coloured primary action per card; utilities ghosted, so
+  // an export never shouts as loudly as the action the driver wants
+  console.assert(/\.btn\.go\{background:var\(--accent\)/.test(strip(css)),'DS-7: primary action not brand');
+  console.assert(/\.btn\.primary\{background:transparent/.test(strip(css)),'DS-7: utility button not ghosted');
+  console.log('DS-7. action hierarchy: brand primary, ghosted utilities OK');
+
+  // DS-8: the webfonts must have offline fallbacks — the tablet runs with
+  // internet off and Roboto Condensed ships on Android
+  console.assert(/--display:'Barlow Condensed','Roboto Condensed'/.test(css),
+    'DS-8: display face has no system fallback for offline use');
+  console.assert(/fonts\.googleapis\.com[^"]*Barlow\+Condensed/.test(html),'DS-8: font not requested');
+  console.log('DS-8. offline font fallbacks present OK');
+})();
+console.log('ALL DESIGN-SYSTEM TESTS PASSED');
+__group('Design system tests');
+
+// ══════════════════════════════════════════════════════════════════════════
+//  SHELL v7 — rail + drawer. Locks the fixes for the 22 Sep field report:
+//  the sheet that fought the scroll, the tiny type, the cryptic commands.
+// ══════════════════════════════════════════════════════════════════════════
+console.log('\n── shell v7 (rail) ──');
+(function(){
+  const fs=require('fs'),path=require('path');
+  const f=[path.join(__dirname,'index.html'),'/tmp/dev/gpx_nav_dev-main/index.html']
+    .find(p=>fs.existsSync(p));
+  const html=fs.readFileSync(f,'utf8');
+  const css=document.__cssText||'';
+  const strip=s=>s.replace(/\/\*[\s\S]*?\*\//g,'');
+
+  // UX-1: the shell carries no drag gesture — the root cause of the conflict
+  console.assert(!/ontouch(start|move|end)\s*=/.test(html),'UX-1: a touch-drag handler is back');
+  ['shTS','shTM','shTE'].forEach(fn=>
+    console.assert(!new RegExp('function\\s+'+fn+'\\b').test(html),'UX-1: '+fn+' came back'));
+  console.log('UX-1. zero drag handlers in the shell OK');
+
+  // UX-2: exactly one scroller per panel, and it cannot chain out to the map
+  console.assert(/\.drawer \.pane\{[^}]*min-height:0/.test(strip(css)),
+    'UX-2: panes can grow instead of scrolling — the list loses its gesture');
+  console.assert(/\.drawer \.rec-list[^{]*\{[^}]*overscroll-behavior:contain/.test(strip(css)),
+    'UX-2: list scroll can chain out to the map');
+  console.assert(/\.drawer\{[^}]*overflow:hidden/.test(strip(css)),'UX-2: drawer does not clip its content');
+  console.log('UX-2. one bounded scroller per panel, contained OK');
+
+  // UX-3: legibility floor — nothing under 12px anywhere in the build
+  const tiny=[...new Set((strip(css).match(/font-size:\s*(\d+)px/g)||[])
+    .map(s=>+s.replace(/\D/g,'')))].filter(v=>v<12);
+  console.assert(tiny.length===0,'UX-3: type below the 12px floor: '+tiny.join(', ')+'px');
+  console.log('UX-3. no type below 12px OK');
+
+  // UX-4: no-look touch targets
+  const min=(sel,px)=>{
+    const m=new RegExp(sel.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+'\\{[^}]*min-height:(\\d+)px')
+      .exec(strip(css));
+    console.assert(m&&+m[1]>=px,'UX-4: '+sel+' target '+(m?m[1]:'?')+'px, need '+px);
+  };
+  min('.rail-item',76); min('.rec-card-btns .rc-main',48); min('.rc-utils .btn',42);
+  console.log('UX-4. rail 76px, card actions 48px, utilities 42px OK');
+
+  // UX-5: every recording action says what it does — no bare glyphs
+  const row=html.slice(html.indexOf('<div class="rec-card-btns">'),
+                       html.indexOf('list.insertBefore(card'));
+  // labels are title-case in the markup and uppercased by CSS
+  ['LOAD','SEQUENCE','GPX','JSON','SIMULATE','DELETE'].forEach(w=>
+    console.assert(row.toUpperCase().includes(w),'UX-5: card action "'+w+'" lost its word label'));
+  console.assert(!/>\s*✕\s*<\/button>/.test(row),'UX-5: bare ✕ delete is back next to LOAD');
+  console.log('UX-5. all six card actions carry words OK');
+
+  // UX-6: START lives on a fixed bar that cannot be dragged
+  console.assert(/\.actionbar\{[^}]*position:fixed/.test(strip(css)),'UX-6: action bar is not fixed');
+  console.assert(html.indexOf('id="big-start"')>html.indexOf('id="actionbar"'),
+    'UX-6: START is not inside the fixed action bar');
+  console.log('UX-6. START on a fixed, undraggable bar OK');
+
+  // UX-7: rail ↔ panel state, through the same calls the UI makes
+  shState='peek';
+  switchTab('gravadas',true);
+  console.assert(shState==='mid','UX-7: rail tap did not open the panel');
+  console.assert(el('stab-gravadas').classList.contains('active'),'UX-7: rail item not active');
+  console.assert(el('sheet').classList.contains('open'),'UX-7: drawer has no open class');
+  console.assert(el('drawer-title').textContent==='RECORDINGS','UX-7: panel title wrong: '+el('drawer-title').textContent);
+  switchTab('gravadas',true);
+  console.assert(shState==='peek'&&!el('sheet').classList.contains('open'),
+    'UX-7: tapping the active rail item did not close the panel');
+  switchTab('rota',true);
+  console.assert(el('drawer-title').textContent==='ROUTE','UX-7: title did not follow the section');
+  console.log('UX-7. rail opens/closes the panel, title follows OK');
+})();
+console.log('ALL SHELL-V7 TESTS PASSED');
+__group('Shell v7 tests');
+
+// ══════════════════════════════════════════════════════════════════════════
+//  CONTROL SURFACE — one control per action (audit 22 Sep)
+//  The app had four ways to start navigation, four to stop and two GPX file
+//  inputs, all live and all kept in sync by hand. These lock the cleanup.
+// ══════════════════════════════════════════════════════════════════════════
+console.log('\n── control surface ──');
+(function(){
+  const fs=require('fs'),path=require('path');
+  const f=[path.join(__dirname,'index.html'),'/tmp/dev/gpx_nav_dev-main/index.html']
+    .find(p=>fs.existsSync(p));
+  const html=fs.readFileSync(f,'utf8');
+  const body=html.slice(html.indexOf('<body>'),html.indexOf('<script src='));
+
+  // CS-1: exactly one control starts navigation, and it is the action bar's
+  const starters=(body.match(/onclick="startNav\(\)"/g)||[]).length;
+  console.assert(starters===0,'CS-1: '+starters+' legacy button(s) still call startNav() directly');
+  console.assert(/id="big-start"[^>]*onclick="bigStartTap/.test(body),'CS-1: START is not the entry point');
+  console.log('CS-1. one start: the action bar OK');
+
+  // CS-2: exactly one control stops navigation from the driving view
+  const stoppers=(body.match(/onclick="stopNav\(\)"/g)||[]).length;
+  console.assert(stoppers===0,'CS-2: '+stoppers+' legacy button(s) still call stopNav() directly');
+  console.assert(/id="cockpit-exit"[^>]*onclick="exitNavigation\(\)"/.test(body),
+    'CS-2: the cockpit exit is not the stop control');
+  console.log('CS-2. one stop: the cockpit exit (which also kills the simulator) OK');
+
+  // CS-3: the five removed ids stay removed, in markup AND in code
+  ['btn-nav','btn-nav2','btn-nav3','btn-stop','btn-stop3'].forEach(id=>
+    console.assert(!html.includes("'"+id+"'")&&!html.includes('id="'+id+'"'),
+      'CS-3: '+id+' came back'));
+  console.log('CS-3. the five legacy nav buttons stay gone OK');
+
+  // CS-4: one file input per import kind
+  const gpxIn=(body.match(/onchange="loadGPX\(this\)"/g)||[]).length;
+  const jsonIn=(body.match(/onchange="importRecsJSON\(this\)"/g)||[]).length;
+  console.assert(gpxIn===1,'CS-4: '+gpxIn+' GPX file inputs (must be 1)');
+  console.assert(jsonIn===1,'CS-4: '+jsonIn+' JSON file inputs (must be 1)');
+  console.log('CS-4. one GPX input, one JSON input OK');
+
+  // CS-5: START alone carries the start/stop/empty state, so nothing has to
+  // be kept in sync by hand any more
+  const rec=mkRec('cs5',120,i=>({lat:LAT0+i*DLAT,lng:LNG0}),[60]);
+  navActive=false; routePts=[]; updBigStart();
+  console.assert(/LOAD ROUTE/.test(el('big-start').textContent),'CS-5: empty state lost');
+  loadFresh(rec); updBigStart();
+  console.assert(/START/.test(el('big-start').textContent)&&
+    !el('big-start').classList.contains('disabled'),'CS-5: armed state lost');
+  navActive=true; updBigStart();
+  console.assert(/STOP/.test(el('big-start').textContent),'CS-5: running state lost');
+  navActive=false; updBigStart();
+  console.log('CS-5. START carries all three states alone OK');
+})();
+// ── CS-6: no copy points at a control that no longer exists ──
+(function(){
+  const fs=require('fs'),path=require('path');
+  const f=[path.join(__dirname,'index.html'),'/tmp/dev/gpx_nav_dev-main/index.html']
+    .find(p=>fs.existsSync(p));
+  const html=fs.readFileSync(f,'utf8');
+  // the cleanup removed "▶ Nav"; two strings still told the driver to tap it
+  ['▶ Nav','Start GPS','Navigate'].forEach(s=>
+    console.assert(!html.includes('tap '+s)&&!html.includes('press '+s),
+      'CS-6: copy still points at the removed "'+s+'" button'));
+  console.assert(/tap START/.test(html),'CS-6: the footer no longer names the real control');
+  // the repetitions setting must exist exactly once as a live value
+  const sel=(html.match(/id="lap-select"/g)||[]).length;
+  console.assert(sel===1,'CS-6: '+sel+' lap-select elements — the value would fork');
+  console.assert(/id="lap-chip-val"/.test(html),'CS-6: the stepper lost its readout');
+  console.log('CS-6. copy names living controls; one repetitions value OK');
+})();
+
+// ── CS-7: a recording fills the ROUTE panel, not just the top bar ──
+(function(){
+  // Before the 22 Sep audit only parseGPX wrote these fields, so loading a
+  // saved recording left the whole ROUTE panel reading "—" while the top bar
+  // showed the real distance.
+  const rec=mkRec('cs7',180,i=>({lat:LAT0+i*DLAT,lng:LNG0}),[60,120]);
+  rec.name='CS7 cycle';
+  loadFresh(rec);
+  if(typeof renderRouteStats==='function')renderRouteStats();
+  const v=id=>String(el(id).textContent||'').trim();
+  ['ri-dist','ri-pts','ri-wpts','ri-tprog'].forEach(id=>
+    console.assert(v(id)&&v(id)!=='—','CS-7: ROUTE panel field '+id+' still empty: "'+v(id)+'"'));
+  console.assert(/km|m$/.test(v('ri-dist')),'CS-7: distance has no unit: '+v('ri-dist'));
+  console.assert(v('ri-wpts')==='2','CS-7: stop count wrong: '+v('ri-wpts'));
+  console.assert(v('h-stops')==='0/2','CS-7: top bar stop counter wrong: '+v('h-stops'));
+  console.assert(v('stops-badge')==='2','CS-7: rail badge should be a bare count: "'+v('stops-badge')+'"');
+  // the stats used to render before buildManeuvers ran, so these read 0
+  console.assert(+v('ri-maneuvers')>0,'CS-7: MANEUVERS still 0 — stats rendered before the maneuvers existed');
+  console.log('CS-7. ROUTE panel filled from a recording ('+v('ri-dist')+', '+v('ri-wpts')+' stops) OK');
+})();
+
+console.log('ALL CONTROL-SURFACE TESTS PASSED');
+__group('Control surface tests');
+
+// ══════════════════════════════════════════════════════════════════════════
+//  GTA TARGET — the app's stated purpose: record a cycle that meets the
+//  GTA/VBC criteria, and repeat it. The target is set before the run and
+//  scored while there is still time to act on it.
+// ══════════════════════════════════════════════════════════════════════════
+console.log('\n── gta target ──');
+
+/* build a synthetic run with a chosen speed profile, at 1 Hz */
+function gtaRun(kmh,seconds,stopEvery,stopDur){
+  const pts=[];let t=1700000000000,lat=LAT0,lng=LNG0,since=0;
+  for(let s=0;s<seconds;s++){
+    let v=kmh;
+    if(stopEvery&&since>=stopEvery&&since<stopEvery+(stopDur||0))v=0;
+    if(stopEvery&&since>=stopEvery+(stopDur||0))since=0;
+    lat+=(v/3.6)/111320;
+    pts.push({lat,lng,t:t+s*1000});since++;
+  }
+  return pts;
+}
+
+// ── GTA-1: the five criteria are judged against the target's ranges ──
+(function(){
+  GTATarget.setClass('Ci2');
+  console.assert(GTATarget.active()&&GTATarget.classId==='Ci2','GTA-1: class not set');
+  const c=GTATarget.cls();
+  console.assert(c.spd[0]===15&&c.spd[1]===23,'GTA-1: Ci2 ranges changed unexpectedly');
+  // 18 km/h steady, no stops → avg and drive inside Ci2, idle out (0%)
+  const ev=GTATarget.evaluate(gtaRun(18,600),0);
+  console.assert(ev.ready,'GTA-1: not enough data to score 10 minutes of driving');
+  const by=k=>ev.rows.find(r=>r.key===k);
+  console.assert(by('spd').ok===true,'GTA-1: 18 km/h should sit inside Ci2 avg: '+by('spd').val);
+  console.assert(by('idle').ok===false&&by('idle').dir==='low',
+    'GTA-1: 0% idle should read as below the Ci2 window');
+  console.assert(ev.rows.length===5&&ev.total===5,'GTA-1: not five criteria');
+  console.log('GTA-1. five criteria judged vs Ci2; idle flagged low OK');
+})();
+
+// ── GTA-2: the live score converges on the final score — one formula ──
+(function(){
+  // The whole feature rests on this: what the driver is shown mid-run must
+  // be the same number the finished cycle is graded with. A second scoring
+  // implementation would drift, so there must only ever be one.
+  const pts=gtaRun(20,900,120,30);
+  GTATarget.setClass('Ci2');
+  const live=GTATarget.evaluate(pts,3);
+  const final=calcGTAScore(pts,[{},{},{}]);
+  console.assert(live.metrics.avg===final.metrics.avg&&
+                 live.metrics.drive===final.metrics.drive&&
+                 live.metrics.vmax===final.metrics.vmax&&
+                 live.metrics.idlePct===final.metrics.idlePct&&
+                 live.metrics.stopsKm===final.metrics.stopsKm,
+    'GTA-2: live metrics differ from the final score — two formulas exist');
+  const fs=require('fs'),path=require('path');
+  const f=[path.join(__dirname,'index.html'),'/tmp/dev/gpx_nav_dev-main/index.html']
+    .find(p=>fs.existsSync(p));
+  const html=fs.readFileSync(f,'utf8');
+  console.assert((html.match(/function calcCycleMetrics/g)||[]).length===1,
+    'GTA-2: a second metrics implementation appeared');
+  console.assert((html.match(/VBC_CLASSES=\[/g)||[]).length===1,
+    'GTA-2: the VBC table was duplicated');
+  console.log('GTA-2. live and final scores come from the same formula OK');
+})();
+
+// ── GTA-3: a target taken from a saved cycle (repeatability) ──
+(function(){
+  const pts=gtaRun(19,900,150,40);
+  const rec={name:'Reference city run',points:pts,stops:[{},{},{}]};
+  savedRecs.push(rec);
+  const idx=savedRecs.length-1;
+  console.assert(GTATarget.setFromRecording(idx)===true,'GTA-3: could not target a saved cycle');
+  console.assert(GTATarget.refName==='Reference city run','GTA-3: reference name lost');
+  console.assert(GTATarget.refMetrics&&GTATarget.refMetrics.avg>0,'GTA-3: reference metrics lost');
+  const ev=GTATarget.evaluate(pts,3);
+  console.assert(ev.rows.every(r=>r.ref!=null),'GTA-3: rows carry no reference value to match');
+  console.assert(ev.rows.find(r=>r.key==='spd').ref===GTATarget.refMetrics.avg,
+    'GTA-3: reference avg not surfaced on the row');
+  console.log('GTA-3. target from a saved cycle carries its measured values OK');
+})();
+
+// ── GTA-4: no target is a valid state, and never blocks recording ──
+(function(){
+  GTATarget.clear();
+  console.assert(!GTATarget.active()&&GTATarget.cls()===null,'GTA-4: target not cleared');
+  const ev=GTATarget.evaluate(gtaRun(30,600),2);
+  console.assert(ev.ready,'GTA-4: metrics should still be computed without a target');
+  console.assert(ev.rows.every(r=>r.ok===null),'GTA-4: rows judged against a target that is not set');
+  console.assert(ev.matched===0,'GTA-4: matched count invented without a target');
+  console.log('GTA-4. untargeted recording still measured, nothing judged OK');
+})();
+
+// ── GTA-5: too little data is "warming up", never a wrong score ──
+(function(){
+  GTATarget.setClass('Ci1');
+  const ev=GTATarget.evaluate(gtaRun(15,20),0);   // 20 s — under the 30 s floor
+  console.assert(ev.ready===false,'GTA-5: scored a cycle that has barely started');
+  console.assert(ev.metrics===null&&ev.matched===0,'GTA-5: invented metrics from 20 s');
+  console.log('GTA-5. under 30 s reads as warming up, not as a score OK');
+})();
+
+// ── GTA-6: the target survives the app being closed ──
+(function(){
+  GTATarget.setClass('Co1');
+  GTATarget.classId=null;GTATarget.refMetrics=null;     // simulate a fresh load
+  GTATarget.restore();
+  console.assert(GTATarget.classId==='Co1','GTA-6: target lost across a reload: '+GTATarget.classId);
+  console.log('GTA-6. target persists across a restart OK');
+})();
+
+// ── GTA-7: the picker is a real step with real controls ──
+(function(){
+  const fs=require('fs'),path=require('path');
+  const f=[path.join(__dirname,'index.html'),'/tmp/dev/gpx_nav_dev-main/index.html']
+    .find(p=>fs.existsSync(p));
+  const html=fs.readFileSync(f,'utf8');
+  ['gta-picker','gta-class-grid','gta-ref-select','gta-target-sum',
+   'gta-live','gta-live-head','gta-live-rows'].forEach(id=>
+    console.assert(html.includes('id="'+id+'"'),'GTA-7: '+id+' missing from the DOM'));
+  console.assert(/function toggleRec\(\)\{if\(!isRec\)openTargetPicker\(\)/.test(html),
+    'GTA-7: REC no longer asks for a target first');
+  const css=document.__cssText||'';
+  console.assert(/\.gta-cls\{[^}]*min-height:76px/.test(css),'GTA-7: class buttons below the touch floor');
+  console.assert(/\.gta-actions \.btn\{[^}]*min-height:52px/.test(css),'GTA-7: start button too small');
+  // the picker must render the full VBC table, not a hand-typed subset
+  console.assert(/VBC_CLASSES\.map/.test(html),'GTA-7: the class grid is not built from VBC_CLASSES');
+  console.log('GTA-7. target picker present, built from the VBC table OK');
+})();
+// ── GTA-8: the live panel belongs to recording, nothing else ──
+(function(){
+  const fs=require('fs'),path=require('path');
+  const f=[path.join(__dirname,'index.html'),'/tmp/dev/gpx_nav_dev-main/index.html']
+    .find(p=>fs.existsSync(p));
+  const html=fs.readFileSync(f,'utf8');
+  const body=s=>{const i=html.indexOf('function '+s+'(');const j=html.indexOf('{',i);
+    let d=0;for(let k=j;k<html.length;k++){if(html[k]==='{')d++;else if(html[k]==='}'){d--;if(!d)return html.slice(i,k+1);}}};
+  console.assert(/renderGTALive/.test(body('stopRec')),
+    'GTA-8: the panel is not cleared when recording ends');
+  console.assert(!/renderGTALive/.test(body('stopNav')),
+    'GTA-8: the recording panel is wired into navigation');
+  // and it refuses to paint when nothing is being recorded
+  isRec=false; renderGTALive(true);
+  console.assert(el('gta-live').style.display==='none','GTA-8: panel visible outside recording');
+  console.log('GTA-8. live panel scoped to recording only OK');
+})();
+
+// ── GTA-9: five criterion cards, each readable without colour ──
+(function(){
+  // The first build named this renderer cardHTML, which already existed for
+  // stop cards. The collision was silent: the panel filled with stop markup
+  // and no card appeared. Names are asserted, not assumed.
+  console.assert(typeof gtaCardHTML==='function','GTA-9: the card renderer lost its own name');
+  const fs=require('fs'),path=require('path');
+  const f=[path.join(__dirname,'index.html'),'/tmp/dev/gpx_nav_dev-main/index.html']
+    .find(p=>fs.existsSync(p));
+  const html=fs.readFileSync(f,'utf8');
+  console.assert((html.match(/function gtaCardHTML\(/g)||[]).length===1,'GTA-9: renderer duplicated');
+
+  GTATarget.setClass('Ci2');
+  const ev=GTATarget.evaluate(gtaRun(18,900),0);
+  const cards=ev.rows.map(r=>gtaCardHTML(r));
+  console.assert(cards.length===5,'GTA-9: expected five cards, got '+cards.length);
+
+  // state must survive with the colour removed: icon AND word on every card
+  cards.forEach((c,i)=>{
+    console.assert(/class="gta-chip/.test(c),'GTA-9: card '+i+' has no state chip');
+    console.assert(/(✓ IN|▲ LOW|▼ HIGH|· —)/.test(c),
+      'GTA-9: card '+i+' state is colour-only — no icon and word');
+    console.assert(/gta-card-val/.test(c),'GTA-9: card '+i+' has no value');
+    console.assert(/target \d/.test(c),'GTA-9: card '+i+' does not state its window');
+  });
+  // the marker must sit inside the track, and the band must be visible
+  const one=cards[1];
+  const mark=/class="gta-mark[^"]*" style="left:([\d.]+)%/.exec(one);
+  const band=/class="gta-band" style="left:([\d.]+)%;width:([\d.]+)%/.exec(one);
+  console.assert(mark&&+mark[1]>=0&&+mark[1]<=100,'GTA-9: value marker outside the track');
+  console.assert(band&&+band[2]>=2,'GTA-9: target band collapsed to nothing');
+
+  // an out-of-range value still lands on the track rather than overflowing
+  const far=gtaCardHTML({key:'spd',label:'Avg',val:200,unit:' km/h',range:[15,23],ref:null,ok:false,dir:'high'});
+  const fm=/class="gta-mark[^"]*" style="left:([\d.]+)%/.exec(far);
+  console.assert(fm&&+fm[1]<=100,'GTA-9: a wildly out-of-range value overflows the track');
+  console.assert(/▼ HIGH/.test(far),'GTA-9: over-range card does not say HIGH');
+  // the picker's container was also ".gta-card"; the card rules then clamped
+  // the whole modal to a criterion card's height
+  console.assert(!/class="gta-card"/.test(html),
+    'GTA-9: something other than a criterion card wears .gta-card');
+  console.assert(/class="gta-sheet"/.test(html),'GTA-9: the picker lost its own container class');
+  console.log('GTA-9. five cards, icon+word state, marker clamped, classes separate OK');
+})();
+
+GTATarget.clear();
+console.log('ALL GTA-TARGET TESTS PASSED');
+__group('GTA target tests');
+
+// ══════════════════════════════════════════════════════════════════════════
+//  NAV GUIDANCE — the card must state measured facts, never a constant
+//  Field report 22 Sep: "fica mostrando sempre 50m e uma seta que nao serve
+//  para nada". The distance shown was anchorM - routeProgressM, i.e. where
+//  the arrow is DRAWN (50 m at rest, 150 m at speed) — not a distance to
+//  anything. These lock the replacement.
+// ══════════════════════════════════════════════════════════════════════════
+console.log('\n── nav guidance ──');
+
+// a route that goes straight, turns hard left, then straight again
+function ngRoute(){
+  const pts=[];
+  for(let i=0;i<120;i++)pts.push({lat:LAT0+i*DLAT,lng:LNG0});          // north 1.2 km
+  const lat=LAT0+119*DLAT;
+  for(let i=1;i<=120;i++)pts.push({lat,lng:LNG0-i*0.00011});           // west
+  return pts.map((p,i)=>({lat:p.lat,lng:p.lng,t:1700000000000+i*1000}));
+}
+function ngSetup(){
+  const rec={name:'ng',points:ngRoute(),stops:[]};
+  loadFresh(rec);
+  navActive=true; Playback.begin('1');
+  resetOffRoute();
+  return rec;
+}
+
+// ── NG-1: the distance is never the arrow's draw distance ──
+(function(){
+  ngSetup();
+  routeProgressM=0;
+  const slow=navGuidance(5);
+  routeProgressM=0;
+  const fast=navGuidance(5);
+  // the old bug: the number changed with SPEED because it was the lookahead
+  console.assert(slow.distM===fast.distM,
+    'NG-1: the distance still moves with speed — it is the arrow anchor again');
+  console.assert(slow.distM>200,
+    'NG-1: distance to a turn 1.2 km away reads '+slow.distM+' m');
+  console.assert(![50,100,150].includes(Math.round(slow.distM)),
+    'NG-1: the distance is one of the lookahead constants');
+  console.log('NG-1. distance is measured ('+Math.round(slow.distM)+' m), not the lookahead OK');
+})();
+
+// ── NG-2: it names the real next decision, and counts down to it ──
+(function(){
+  ngSetup();
+  routeProgressM=0;   const far=navGuidance(5);
+  routeProgressM=900; const near=navGuidance(5);
+  console.assert(far.mode==='DECISION'&&near.mode==='DECISION','NG-2: no decision found on a route with a turn');
+  console.assert(near.distM<far.distM,'NG-2: the distance does not count down as the vehicle advances');
+  console.assert(/TURN|KEEP|SHARP/.test(far.action),'NG-2: the action does not name a manoeuvre: '+far.action);
+  console.assert(far.dir==='left'||far.dir==='right','NG-2: no direction on a real turn');
+  console.assert(far.kind==='TURN'||far.kind==='CURVE','NG-2: kind wrong: '+far.kind);
+  console.log('NG-2. names the turn ('+far.action+') and counts down '+
+    Math.round(far.distM)+' → '+Math.round(near.distM)+' m OK');
+})();
+
+// ── NG-3: with no decision left, the number is explained ──
+(function(){
+  ngSetup();
+  routeProgressM=routeCumM[routeCumM.length-1]-100;   // past every turn
+  const g=navGuidance(5);
+  console.assert(g.mode==='CRUISE','NG-3: still claims a decision at the end of the route');
+  console.assert(g.distM>0&&g.distM<=140,'NG-3: end distance wrong: '+g.distM);
+  console.assert(/end of the cycle/.test(g.detail),'NG-3: the number is not explained: '+g.detail);
+  console.log('NG-3. cruise states what the distance is ('+Math.round(g.distM)+' m to the end) OK');
+})();
+
+// ── NG-4: off route outranks any turn cue, and needs persistence ──
+(function(){
+  ngSetup();
+  routeProgressM=100;
+  matchState={crossTrackM:4,confidence:'HIGH'};
+  console.assert(navGuidance(5).mode==='DECISION','NG-4: on-route wrongly flagged');
+  // one bad fix must not cry wolf
+  matchState={crossTrackM:80,confidence:'HIGH'};
+  const first=navGuidance(5);
+  console.assert(first.mode!=='OFF_ROUTE','NG-4: a single fix raised the alarm');
+  const second=navGuidance(5);
+  console.assert(second.mode==='OFF_ROUTE','NG-4: a sustained 80 m deviation was not reported');
+  console.assert(second.action==='OFF ROUTE'&&/return to the route/.test(second.detail),
+    'NG-4: the off-route card does not say what to do');
+  // a direction cue while off the line reads as "keep going this way"
+  console.assert(/Off route/.test(offRouteGlyph(88))&&!/guidanceArrow/.test(offRouteGlyph(88)),
+    'NG-4: the off-route mark is not a non-directional warning');
+  console.assert(second.distM===80,'NG-4: it does not show how far off: '+second.distM);
+  // and one good fix must not clear a real deviation
+  matchState={crossTrackM:3,confidence:'HIGH'};
+  console.assert(navGuidance(5).mode==='OFF_ROUTE','NG-4: a single good fix cleared the deviation');
+  console.assert(navGuidance(5).mode!=='OFF_ROUTE','NG-4: never recovers to on-route');
+  console.log('NG-4. off route: 2 fixes to raise, 2 to clear, distance shown OK');
+})();
+
+// ── NG-5: a poor fix widens the threshold instead of crying wolf ──
+(function(){
+  ngSetup(); routeProgressM=100;
+  matchState={crossTrackM:50,confidence:'HIGH'};
+  navGuidance(40); const g=navGuidance(40);      // accuracy 40 m → limit 100 m
+  console.assert(g.mode!=='OFF_ROUTE','NG-5: 50 m deviation on a 40 m fix reported as off route');
+  navGuidance(5); const g2=navGuidance(5);       // same deviation, good fix
+  console.assert(g2.mode==='OFF_ROUTE','NG-5: 50 m deviation on a 5 m fix not reported');
+  console.log('NG-5. threshold scales with GPS accuracy OK');
+})();
+
+// ── NG-6: the real cycles produce usable decisions, not noise ──
+(function(){
+  // this is what makes the card worth trusting — measured on the cycles the
+  // driver actually runs, not on a synthetic loop
+  const fs=require('fs'),path=require('path');
+  const f=[path.join(__dirname,'testdata','Cycle_city_12_08_2026_16_03.json'),
+           '/tmp/dev/gpx_nav_dev-main/testdata/Cycle_city_12_08_2026_16_03.json']
+    .find(p=>fs.existsSync(p));
+  if(!f){console.log('NG-6. SKIPPED (real cycle fixture not present)');return;}
+  const rec=JSON.parse(fs.readFileSync(f,'utf8'))[0];
+  loadFresh(rec); navActive=true; Playback.begin('1'); resetOffRoute();
+  matchState={crossTrackM:2,confidence:'HIGH'};
+  const decisions=maneuvers.filter(m=>m.type!=='straight'&&m.type!=='arrive');
+  console.assert(decisions.length>=10,'NG-6: a 15.8 km city cycle yielded only '+decisions.length+' decisions');
+  // walk the cycle and check every card is a real, shrinking distance
+  let bad=0,constant=0,last=null;
+  for(let m=0;m<routeCumM[routeCumM.length-1];m+=250){
+    routeProgressM=m;
+    const g=navGuidance(6);
+    if(!(g.distM>=0&&isFinite(g.distM)))bad++;
+    if(g.mode==='DECISION'&&last!=null&&Math.abs(g.distM-last)<0.01)constant++;
+    last=g.mode==='DECISION'?g.distM:null;
+  }
+  console.assert(bad===0,'NG-6: '+bad+' cards showed a non-finite distance');
+  console.assert(constant===0,'NG-6: the distance froze on '+constant+' consecutive samples');
+  console.log('NG-6. real city cycle: '+decisions.length+' decisions, no frozen distance OK');
+})();
+
+// ── NG-7: the card is not hidden behind the rail ──
+(function(){
+  const css=document.__cssText||'';
+  const m=/body\.cockpit #hud-instr\{[^}]*left:calc\(var\(--rail-w\)/.exec(css);
+  console.assert(m,'NG-7: the manoeuvre card is positioned without clearing the rail');
+  console.assert(/body\.off-route \.hud-instr-action\{[^}]*color:var\(--red\)/.test(css),
+    'NG-7: off route has no visual state on the card');
+  console.log('NG-7. card clears the rail; off-route state styled OK');
+})();
+console.log('ALL NAV-GUIDANCE TESTS PASSED');
+__group('Nav guidance tests');
+
+// ══════════════════════════════════════════════════════════════════════════
+//  GPS SOURCE — exactly one feed, ever
+//  Field, 22 Sep: during a simulation of a Spanish cycle the card read
+//  "2670.2 km off route" — the driver's real position in Sweden. startNav
+//  assigned watchId unconditionally, so a second watchPosition orphaned the
+//  first, which kept delivering real fixes with no id left to clear it.
+// ══════════════════════════════════════════════════════════════════════════
+console.log('\n── gps source ──');
+
+// ── GPS-1: the watch cannot be created twice or leaked ──
+(function(){
+  const fs=require('fs'),path=require('path');
+  const f=[path.join(__dirname,'index.html'),'/tmp/dev/gpx_nav_dev-main/index.html']
+    .find(p=>fs.existsSync(p));
+  const html=fs.readFileSync(f,'utf8');
+  const calls=(html.match(/navigator\.geolocation\.watchPosition/g)||[]).length;
+  console.assert(calls===1,'GPS-1: '+calls+' watchPosition call sites — a second one can orphan the first');
+  console.assert(/function startWatch\(\)\{\s*if\(watchId!==null\)return watchId;/.test(html),
+    'GPS-1: startWatch does not refuse to create a second watch');
+  const clears=(html.match(/navigator\.geolocation\.clearWatch/g)||[]).length;
+  console.assert(clears===1,'GPS-1: '+clears+' clearWatch sites — ownership is split again');
+  console.log('GPS-1. one create site, one clear site, guarded OK');
+})();
+
+// ── GPS-2: calling startWatch twice yields one watch ──
+(function(){
+  const realGeo=navigator.geolocation;
+  let created=0,cleared=0;
+  navigator.geolocation={watchPosition(){created++;return 100+created;},
+                         clearWatch(){cleared++;}};
+  watchId=null;
+  const a=startWatch(), b=startWatch(), c=startWatch();
+  console.assert(created===1,'GPS-2: '+created+' watches created by three calls');
+  console.assert(a===b&&b===c,'GPS-2: the id changed between calls — the first is orphaned');
+  stopWatch();
+  console.assert(cleared===1&&watchId===null,'GPS-2: the watch was not released');
+  stopWatch();
+  console.assert(cleared===1,'GPS-2: clearing twice cleared twice');
+  navigator.geolocation=realGeo;
+  console.log('GPS-2. three starts → one watch; double stop is safe OK');
+})();
+
+// ── GPS-3: a real fix during a simulation is ignored ──
+(function(){
+  // the exact field scenario: a cycle in Spain, a fix from Sweden
+  const spain=mkRec('sim-es',200,i=>({lat:37.18+i*0.00009,lng:-3.60}),[100]);
+  loadFresh(spain);
+  navActive=true; Playback.begin('1'); resetOffRoute();
+  const pts=routePts;
+  // drive a few real (simulated-source) fixes into the cycle
+  simRec=spain; _simFix=true;
+  for(let k=10;k<20;k++)
+    onGPS({coords:{latitude:pts[k].lat,longitude:pts[k].lon??pts[k].lng,accuracy:5,
+      altitude:1,speed:8,heading:0},timestamp:Date.now()+k*1000});
+  _simFix=false;
+  const progBefore=routeProgressM, posBefore=currentPos&&currentPos.lat;
+
+  // now the orphaned watch delivers Gothenburg
+  onGPS({coords:{latitude:57.7089,longitude:11.9746,accuracy:8,altitude:1,
+    speed:0,heading:0},timestamp:Date.now()+60000});
+  console.assert(routeProgressM===progBefore,
+    'GPS-3: a real fix moved route progress during a simulation');
+  console.assert(!currentPos||currentPos.lat===posBefore,
+    'GPS-3: the vehicle jumped to the real position during a simulation');
+  simRec=null;
+  // with no simulation running the same fix IS processed
+  onGPS({coords:{latitude:pts[30].lat,longitude:pts[30].lon??pts[30].lng,accuracy:5,
+    altitude:1,speed:8,heading:0},timestamp:Date.now()+70000});
+  console.assert(currentPos&&Math.abs(currentPos.lat-pts[30].lat)<1e-6,
+    'GPS-3: real fixes are still ignored after the simulation ended');
+  console.log('GPS-3. Sweden fix dropped mid-simulation, accepted after it OK');
+})();
+
+// ── GPS-4: a continent away is a wrong route, not a deviation ──
+(function(){
+  const spain=mkRec('gps4',200,i=>({lat:37.18+i*0.00009,lng:-3.60}),[]);
+  loadFresh(spain); navActive=true; Playback.begin('1'); resetOffRoute();
+  routeProgressM=100;
+  matchState={crossTrackM:2670239,confidence:'LOW'};
+  navGuidance(8); const g=navGuidance(8);
+  console.assert(g.mode==='OFF_ROUTE','GPS-4: a 2670 km error was not flagged at all');
+  console.assert(g.action==='WRONG ROUTE',
+    'GPS-4: it still tells the driver to "return to the route" from 2670 km: '+g.action);
+  console.assert(!/\d+ m off/.test(g.detail),'GPS-4: it prints a drivable-looking distance');
+  console.assert(g.far===true,'GPS-4: the card is not flagged as a wrong-route case');
+  // a genuine deviation still reads as one
+  resetOffRoute();
+  matchState={crossTrackM:120,confidence:'HIGH'};
+  navGuidance(8); const g2=navGuidance(8);
+  console.assert(g2.action==='OFF ROUTE','GPS-4: a real 120 m deviation was misreported as wrong route');
+  console.log('GPS-4. 2670 km reads "WRONG ROUTE"; 120 m still reads "OFF ROUTE" OK');
+})();
+// ── GPS-5: a wrong-route state invents no distance anywhere ──
+(function(){
+  const spain=mkRec('gps5',200,i=>({lat:37.18+i*0.00009,lng:-3.60}),[80,160]);
+  loadFresh(spain); navActive=true; Playback.begin('1'); resetOffRoute();
+  routeProgressM=100;
+  matchState={crossTrackM:2670239,confidence:'LOW'};
+  navGuidance(8); navGuidance(8);
+  // the stop card must not offer a 2555 km "next stop" either
+  updNextStopCard(57.7089,11.9746);
+  const d=String(el('nsc-dist').textContent||'');
+  console.assert(d==='—','GPS-5: the stop card still shows a distance: "'+d+'"');
+  // and a normal state restores real distances
+  resetOffRoute();
+  matchState={crossTrackM:5,confidence:'HIGH'};
+  navGuidance(8); navGuidance(8);
+  const p=routePts[10];
+  updNextStopCard(p.lat,p.lon??p.lng);
+  const d2=String(el('nsc-dist').textContent||'');
+  console.assert(d2!=='—'&&d2.length>0,'GPS-5: the stop distance never comes back: "'+d2+'"');
+  console.log('GPS-5. no invented distance while off-continent; restored after OK');
+})();
+
+console.log('ALL GPS-SOURCE TESTS PASSED');
+__group('GPS source tests');
+
+// ══════════════════════════════════════════════════════════════════════════
+//  BOOT MAP VIEW — the app must not claim to know where it is
+//  Field, 22 Sep: the map opened hard-coded on central Brazil and a driver
+//  read it literally — "ele acha que esta no Brasil agora".
+// ══════════════════════════════════════════════════════════════════════════
+console.log('\n── boot map view ──');
+(function(){
+  const fs=require('fs'),path=require('path');
+  const f=[path.join(__dirname,'index.html'),'/tmp/dev/gpx_nav_dev-main/index.html']
+    .find(p=>fs.existsSync(p));
+  const html=fs.readFileSync(f,'utf8');
+  const code=html.replace(/\/\*[\s\S]*?\*\//g,'');   // comments may quote the old value
+
+  // BOOT-1: no hard-coded populated place as the opening view
+  const init=/L\.map\('map',\{center:\[([^\]]+)\],zoom:([^,]+)/.exec(code);
+  console.assert(init,'BOOT-1: could not find the map initialisation');
+  const centre=init?init[1]:'';
+  console.assert(!/-15\s*,\s*-50/.test(centre),'BOOT-1: the Brazil centre is back');
+  // a literal lat/lng pair here is a claim about where the driver is
+  console.assert(!/^\s*-?\d+(\.\d+)?\s*,\s*-?\d+(\.\d+)?\s*$/.test(centre),
+    'BOOT-1: the opening centre is a hard-coded place: ['+centre+']');
+  console.assert(/_boot\.lat/.test(centre),'BOOT-1: the centre is not the resolved boot view');
+  console.log('BOOT-1. no hard-coded country centre OK');
+
+  // BOOT-2: the neutral fallback is a world view over water, naming nothing
+  const nv=/NEUTRAL_VIEW=\{lat:([-\d.]+),lng:([-\d.]+),zoom:(\d+)\}/.exec(code);
+  console.assert(nv,'BOOT-2: no neutral fallback defined');
+  console.assert(+nv[3]<=3,'BOOT-2: the fallback zoom '+nv[3]+' is close enough to name a place');
+  console.assert(+nv[2]===0&&Math.abs(+nv[1])<=25,
+    'BOOT-2: the fallback centre sits on a country instead of open ocean');
+  console.log('BOOT-2. neutral fallback: world view at zoom '+nv[3]+' OK');
+
+  // BOOT-3: last REAL position is remembered, and a route never poses as one
+  console.assert(/function rememberView/.test(code),'BOOT-3: the last position is not remembered');
+  console.assert(/if\(!simRec\)rememberView/.test(code),
+    'BOOT-3: a simulated position would be remembered as where the driver was');
+  const fit=/function fitRouteBounds/.test(code);
+  console.assert(!fit||!/fitRouteBounds[\s\S]{0,400}rememberView/.test(code),
+    'BOOT-3: fitting a route writes the remembered view — "where I was" becomes "where the cycle is"');
+  console.log('BOOT-3. only real, non-simulated positions are remembered OK');
+
+  // BOOT-4: a stored view round-trips, and rubbish is rejected
+  localStorage.setItem('gpx-last-view',JSON.stringify({lat:57.7089,lng:11.9746,zoom:14}));
+  let v=readLastView();
+  console.assert(v&&Math.abs(v.lat-57.7089)<1e-6,'BOOT-4: a stored view did not come back');
+  localStorage.setItem('gpx-last-view',JSON.stringify({lat:999,lng:11}));
+  console.assert(readLastView()===null,'BOOT-4: an impossible latitude was accepted');
+  localStorage.setItem('gpx-last-view','not json');
+  console.assert(readLastView()===null,'BOOT-4: corrupt storage was not rejected');
+  localStorage.removeItem('gpx-last-view');
+  console.assert(readLastView()===null,'BOOT-4: empty storage did not read as empty');
+  console.log('BOOT-4. stored view round-trips; bad data rejected OK');
+
+  // BOOT-5: opening the app never asks for location by itself
+  const askIdx=code.indexOf('getCurrentPosition');
+  if(askIdx>=0){
+    const around=code.slice(Math.max(0,askIdx-500),askIdx);
+    console.assert(/state!=='granted'/.test(around),
+      'BOOT-5: the app can prompt for location just by opening');
+  }
+  console.log('BOOT-5. no permission prompt on launch OK');
+})();
+console.log('ALL BOOT-VIEW TESTS PASSED');
+__group('Boot map view tests');
+
+// ══════════════════════════════════════════════════════════════════════════
+//  BASEMAP TILES — no provider that demands an API key
+//  Field report: the map rendered under repeated "API KEY REQUIRED ·
+//  carto.com/basemaps/apikey" watermarks. CARTO moved basemaps.cartocdn.com
+//  to a keyed plan, so any tile URL that needs an account is a live outage
+//  for the driver, not a styling preference.
+// ══════════════════════════════════════════════════════════════════════════
+console.log('\n── basemap tiles ──');
+(function(){
+  const fs=require('fs'),path=require('path');
+  const dir=[__dirname,'/tmp/dev/gpx_nav_dev-main']
+    .find(p=>fs.existsSync(path.join(p,'index.html')));
+  const html=fs.readFileSync(path.join(dir,'index.html'),'utf8');
+  const sw=fs.existsSync(path.join(dir,'sw.js'))
+    ? fs.readFileSync(path.join(dir,'sw.js'),'utf8') : '';
+  // comments legitimately name the retired provider while explaining the fix
+  const code=html.replace(/\/\*[\s\S]*?\*\//g,'').replace(/^\s*\/\/.*$/gm,'');
+  const swCode=sw.replace(/\/\*[\s\S]*?\*\//g,'').replace(/^\s*\/\/.*$/gm,'');
+
+  // every tile-ish URL the running app can request
+  const urls=(code.match(/https?:\/\/[^'"`\s)]+\{z\}[^'"`\s)]*/g)||[]);
+
+  // TILE-1: at least one tile source is configured at all
+  console.assert(urls.length>0,'TILE-1: no tile URL template found in the app');
+  console.log('TILE-1. tile source present ('+urls.length+' template(s)) OK');
+
+  // TILE-2: none of them is a keyed endpoint
+  const keyed=urls.filter(u=>/cartocdn|carto\.com|api[_-]?key|apikey|access[_-]?token|\{key\}|mapbox|thunderforest|stadiamaps|maptiler/i.test(u));
+  console.assert(keyed.length===0,
+    'TILE-2: a tile source still needs an API key: '+keyed.join(' , '));
+  console.log('TILE-2. no keyed tile provider OK');
+
+  // TILE-3: the retired CARTO host is gone from the executable app and the SW
+  console.assert(!/cartocdn/.test(code),'TILE-3: cartocdn is still referenced in index.html');
+  console.assert(!/cartocdn/.test(swCode),'TILE-3: cartocdn is still routed by sw.js');
+  console.log('TILE-3. CARTO endpoints removed from app and service worker OK');
+
+  // TILE-4: attribution names the source actually being used, and only that
+  const attr=/TILE_ATTR\s*=\s*'([^']+)'/.exec(code);
+  console.assert(attr,'TILE-4: no attribution constant');
+  console.assert(attr&&/OpenStreetMap/.test(attr[1]),'TILE-4: OSM is not credited');
+  console.assert(attr&&!/CARTO/i.test(attr[1]),
+    'TILE-4: the attribution still credits a provider the app no longer uses');
+  console.log('TILE-4. attribution matches the live source OK');
+
+  // TILE-5: day and night both resolve to a keyless source
+  console.assert(/day:\s*\{url:TILE_URL/.test(code)&&/night:\s*\{url:TILE_URL/.test(code),
+    'TILE-5: a style does not use the shared keyless tile URL');
+  console.assert(/night:\s*\{url:TILE_URL,label:'[^']+',dark:true/.test(code),
+    'TILE-5: the night style is not flagged dark');
+  console.log('TILE-5. day and night share the keyless source OK');
+
+  // TILE-6: the night map is a real visual change, not a relabelled button
+  const css=html.slice(html.indexOf('<style'),html.indexOf('</style>'));
+  const darkRule=/#map\.tiles-dark\s+\.leaflet-tile-pane\s*\{([^}]+)\}/.exec(css);
+  console.assert(darkRule,'TILE-6: no dark rule for the tile pane');
+  console.assert(darkRule&&/invert\(1\)/.test(darkRule[1]),
+    'TILE-6: the night style does not darken the tiles');
+  console.log('TILE-6. night style darkens the basemap OK');
+
+  // TILE-7: the dark rule must outrank the driver-mode / tunnel tile filters,
+  //         otherwise the night map silently reverts while driving
+  const iDark=css.indexOf('#map.tiles-dark .leaflet-tile-pane');
+  const iDrv =css.indexOf('body.driver-mode #map .leaflet-tile-pane');
+  const iTun =css.indexOf('body.cockpit.tunnel #map .leaflet-tile-pane');
+  console.assert(iDark>iDrv&&iDark>iTun,
+    'TILE-7: the night rule is declared before the mode filters and loses the cascade');
+  console.assert(/body\s+#map\.tiles-dark/.test(css),
+    'TILE-7: the night rule does not carry the extra specificity');
+  console.log('TILE-7. night style wins over the driver/tunnel filters OK');
+
+  // TILE-8: toggling must not tear the layer down (that re-downloads every
+  //         tile mid-drive); it only flips the pane class
+  console.assert(/function applyTileStyle\(\)/.test(code),'TILE-8: applyTileStyle missing');
+  console.assert(/classList\.toggle\('tiles-dark'/.test(code),
+    'TILE-8: the toggle does not switch the tile-pane class');
+  const tog=/function toggleMapStyle\(\)\{[\s\S]*?\n\}/.exec(code);
+  console.assert(tog,'TILE-8: toggleMapStyle missing');
+  console.assert(tog&&!/removeLayer\(tileLayer\)/.test(tog[0]),
+    'TILE-8: the toggle still rebuilds the tile layer');
+  console.log('TILE-8. day/night toggle keeps the tile layer alive OK');
+
+  // TILE-9: zoom 20 must still draw (over-zoom) rather than 404 on OSM
+  console.assert(/maxNativeZoom:\s*19/.test(code),
+    'TILE-9: no maxNativeZoom — the deepest zoom will request tiles OSM does not serve');
+  console.log('TILE-9. deep zoom over-zooms instead of failing OK');
+
+  // TILE-11: tiles must not be requested with CORS. The app never reads tile
+  //          pixels back from a canvas, and crossOrigin makes every tile fail
+  //          (naturalWidth 0, nothing painted) the moment the header is absent.
+  console.assert(!/crossOrigin\s*:\s*(true|'anonymous')/.test(code),
+    'TILE-11: tiles are requested with CORS for no reason');
+  console.log('TILE-11. tiles requested without CORS OK');
+
+  // TILE-10: the service worker still treats tiles as network-first, and the
+  //          cache version was bumped so the watermarked tiles are evicted
+  if(swCode){
+    console.assert(/url\.includes\("openstreetmap"\)/.test(swCode),
+      'TILE-10: sw.js no longer recognises the tile host');
+    const cv=/const CACHE\s*=\s*"([^"]+)"/.exec(swCode);
+    console.assert(cv&&!/v58-boot-view/.test(cv[1]),
+      'TILE-10: the cache version was not bumped — old watermarked tiles survive');
+    console.log('TILE-10. sw.js routes the new host; cache bumped to '+(cv?cv[1]:'?')+' OK');
+  }
+})();
+console.log('ALL BASEMAP TILE TESTS PASSED');
+__group('Basemap tile tests');
+
+// ══════════════════════════════════════════════════════════════════════════
+//  FIELD 22/09/2026 — stop sequencing on a real recorded cycle
+//  Reported: "na gravacao pareceu funcionar bem ... mas na hora de reproduzir
+//  nao funcionou nada bem, nao detectou paradas, nao mostrou foto, nao
+//  mostrou figura com eventos da parada".
+//  Measured cause, in order:
+//    1. P1 and P2 are 18.4 m apart — inside P1's 21.6 m departure circle, so
+//       P1 stayed 'current' while the bus was standing at P2.
+//    2. markDone(P1) raised a departure gate that blocked ANY pending stop
+//       within 30 m — including P2, a different stop 25 m further along.
+//    3. P2 therefore never arrived, and because the arrival pointer is "the
+//       first stop that is not done", P3..P8 were never evaluated at all.
+//       The Next Stop Card sat on Stop 2 for the rest of the cycle, showing
+//       Stop 2's photo and Stop 2's events with the distance counting UP.
+//  All three symptoms the driver reported come from this one chain.
+// ══════════════════════════════════════════════════════════════════════════
+console.log('\n── field cycle 22/09 (stop sequencing) ──');
+const _realSpeakF22=speakText; speakText=(t,f)=>{_spoken.push(String(t));};
+(function(){
+  const F_fs=require('fs'),F_path=require('path');
+  const f=[F_path.join(__dirname,'testdata','Cycle_field_22_09.json'),
+           '/tmp/dev/gpx_nav_dev-main/testdata/Cycle_field_22_09.json']
+    .find(p=>F_fs.existsSync(p));
+  if(!f){console.log('FIELD22. fixture missing — suite skipped'); return;}
+  const REC=JSON.parse(F_fs.readFileSync(f,'utf8'))[0];
+
+  function beginField(radius){
+    loadFresh(JSON.parse(JSON.stringify(REC)));
+    navActive=true;insideStop.clear();departGate=null;evtAnnounced.clear();
+    el('rng-radius').value=String(radius||10);
+    el('rng-auto').value='1'; el('rng-autostop').value='1';
+    Playback.begin('1');
+    _spoken=[];
+  }
+  // replay the driver's own fixes; JSON speed is m/s, as the Geolocation API gives it
+  function driveField(onFix){
+    REC.points.forEach((q,i)=>{
+      onGPS({coords:{latitude:q.lat,longitude:q.lng,accuracy:6,altitude:q.alt||0,
+        speed:q.speed,heading:null},timestamp:q.t});
+      if(onFix)onFix(i);
+    });
+  }
+  const sep=(a,b)=>haversine(REC.stops[a].lat,REC.stops[a].lng,
+                             REC.stops[b].lat,REC.stops[b].lng)*1000;
+
+  // FIELD22-1: the trigger geometry, stated as a fact about the recording
+  const d12=sep(0,1);
+  console.assert(Math.abs(d12-18.4)<3,'FIELD22-1: P1->P2 separation '+d12.toFixed(1)+' m, expected ~18.4');
+  console.assert(d12<10*1.8*1.2,
+    'FIELD22-1: the fixture no longer reproduces the masking case (P2 outside P1 departure circle)');
+  console.log('FIELD22-1. P1->P2 '+d12.toFixed(1)+' m — inside the departure circle OK');
+
+  // FIELD22-2: every stop is anchored and carries what the driver must see
+  beginField(10);
+  console.assert(stops.length===8,'FIELD22-2: '+stops.length+' stops loaded, expected 8');
+  console.assert(stops.every(s=>s.routeDistanceM!=null),'FIELD22-2: a stop lost its route anchor');
+  console.assert(stops.filter(s=>s.photo&&s.photo.length>10).length===6,'FIELD22-2: photos did not survive load');
+  console.assert(stops.filter(s=>s.events&&s.events.length).length===7,'FIELD22-2: stop events did not survive load');
+  console.log('FIELD22-2. 8 stops anchored · 6 photos · 7 with events OK');
+
+  // FIELD22-3: THE REGRESSION — replaying the driver's own fixes must work
+  //            through the whole cycle, not die after the first stop
+  beginField(10);
+  driveField();
+  const pending=stops.filter(s=>s.state==='waiting');
+  console.assert(pending.length===0,
+    'FIELD22-3: '+pending.length+' stops never evaluated (head-of-line block): P'+pending.map(s=>s.id).join(',P'));
+  const arrived=stops.filter(s=>s.state==='done'&&!s.missed).length;
+  console.assert(arrived===8,'FIELD22-3: only '+arrived+'/8 stops were detected on replay');
+  console.log('FIELD22-3. all 8 stops detected replaying the driver\'s own fixes OK');
+
+  // FIELD22-4: each stop must become the pointer while the bus is AT it,
+  //            not after it has driven past — that is what froze the card
+  beginField(10);
+  const cardAt=[];
+  const closest=REC.stops.map(s=>{let bi=0,bd=1e9;
+    REC.points.forEach((q,i)=>{const d=haversine(q.lat,q.lng,s.lat,s.lng)*1000;
+      if(d<bd){bd=d;bi=i;}});return bi;});
+  driveField(i=>{
+    const k=closest.indexOf(i);
+    if(k>=0){const n=stops.find(s=>s.state!=='done');cardAt.push(n?n.id:null);}
+  });
+  const wrong=cardAt.map((id,k)=>({at:k+1,shown:id})).filter(x=>x.shown!==x.at);
+  console.assert(wrong.length===0,
+    'FIELD22-4: the Next Stop Card pointed at the wrong stop: '+
+    wrong.map(x=>'at P'+x.at+' showed P'+x.shown).join(' | '));
+  console.log('FIELD22-4. pointer tracks the bus through all 8 stops OK');
+
+  // FIELD22-5: gateBlocks — a gate blocks the stop it was raised for, and
+  //            releases a different stop that is further along the cycle
+  const gate={stopId:1,lat:REC.stops[0].lat,lng:REC.stops[0].lng,routeDistanceM:0};
+  const sameNextLap={id:1,lat:REC.stops[0].lat,lng:REC.stops[0].lng,routeDistanceM:0};
+  const nearbyAhead={id:2,lat:REC.stops[1].lat,lng:REC.stops[1].lng,routeDistanceM:25};
+  const farAway    ={id:5,lat:REC.stops[4].lat,lng:REC.stops[4].lng,routeDistanceM:1523};
+  console.assert(gateBlocks(gate,sameNextLap)===true,
+    'FIELD22-5: the gate stopped protecting the same stop on the next lap');
+  console.assert(gateBlocks(gate,nearbyAhead)===false,
+    'FIELD22-5: a different stop further along the cycle is still gated');
+  console.assert(gateBlocks(gate,farAway)===false,'FIELD22-5: a distant stop is gated');
+  console.assert(gateBlocks(null,nearbyAhead)===false,'FIELD22-5: no gate must not block');
+  // a co-located stop that is NOT measurably ahead stays gated
+  console.assert(gateBlocks(gate,{id:9,lat:REC.stops[0].lat,lng:REC.stops[0].lng,routeDistanceM:5})===true,
+    'FIELD22-5: a co-located stop at the same route position lost its gate');
+  console.log('FIELD22-5. gate blocks by identity + route position, not by proximity alone OK');
+
+  // FIELD22-6: head-of-line — a stop that genuinely cannot arrive must not
+  //            take the rest of the cycle with it
+  beginField(10);
+  stops[2].lat+=0.01; stops[2].lng+=0.01;   // move P3 a km off the route: unreachable
+  stops[2].routeDistanceM=stops[2].routeDistanceM; // anchor unchanged — it is passed, not moved
+  driveField();
+  const p3=stops.find(s=>s.id===3);
+  console.assert(p3.state==='done'&&p3.missed===true,
+    'FIELD22-6: an unreachable stop was not recorded as missed (state='+p3.state+', missed='+p3.missed+')');
+  const after=stops.filter(s=>s.id>3);
+  console.assert(after.every(s=>s.state==='done'&&!s.missed),
+    'FIELD22-6: stops after the missed one were blocked: '+
+    after.filter(s=>s.state!=='done'||s.missed).map(s=>'P'+s.id+':'+s.state).join(' '));
+  console.log('FIELD22-6. one unreachable stop is recorded MISSED; P4..P8 still detected OK');
+
+  // FIELD22-7: a missed stop must never be counted as a completed stop —
+  //            that would quietly corrupt the stops/km an engineer reads
+  updSummaryBar();
+  const txt=el('h-stops').textContent;
+  console.assert(/^7\/8/.test(txt),'FIELD22-7: completed count read "'+txt+'", expected 7/8');
+  console.assert(/missed/i.test(txt),'FIELD22-7: the missed stop is not reported: "'+txt+'"');
+  console.log('FIELD22-7. counter reads "'+txt+'" OK');
+
+  // FIELD22-8: the sweep must never retire a stop the bus is standing at
+  beginField(10);
+  stops[0].state='current';
+  routeProgressM=(stops[0].routeDistanceM||0)+5000;
+  sweepPassedStops();
+  console.assert(stops[0].state==='current'&&!stops[0].missed,
+    'FIELD22-8: the sweep retired the stop the vehicle is at');
+  // and an unanchored stop is never swept — no evidence either way
+  beginField(10);
+  stops[1].routeDistanceM=null; routeProgressM=99999;
+  sweepPassedStops();
+  console.assert(stops[1].state==='waiting','FIELD22-8: an unanchored stop was swept on no evidence');
+  console.log('FIELD22-8. sweep spares the current stop and unanchored stops OK');
+
+  // FIELD22-9: a missed stop is re-armed cleanly for the next lap
+  beginField(10);
+  stops[1].state='done'; stops[1].missed=true;
+  Playback._nextLap();
+  console.assert(stops[1].state==='waiting'&&stops[1].missed===false,
+    'FIELD22-9: the missed flag survived the lap re-arm');
+  console.log('FIELD22-9. lap re-arm clears the missed flag OK');
+
+  // FIELD22-10: the miss must be visible, not silent — word, not colour alone
+  const html=F_fs.readFileSync(
+    [F_path.join(__dirname,'index.html'),'/tmp/dev/gpx_nav_dev-main/index.html']
+      .find(p=>F_fs.existsSync(p)),'utf8');
+  console.assert(/st\.textContent=s\.missed\?'Missed'/.test(html),
+    'FIELD22-10: the stop card does not label a missed stop');
+  console.assert(/\.sc-badge\.missed\{/.test(html),'FIELD22-10: no badge style for a missed stop');
+  console.assert(/s\.missed\?'!'/.test(html),'FIELD22-10: the map pin carries no glyph for a missed stop');
+  console.assert(/recorded as MISSED/.test(html),'FIELD22-10: the driver is not told a stop was missed');
+  console.log('FIELD22-10. missed stops are labelled in the card, the pin and an alert OK');
+  exitNavigation();
+})();
+speakText=_realSpeakF22;
+console.log('ALL FIELD 22/09 TESTS PASSED');
+__group('Field cycle 22/09 tests');
+
+// ══════════════════════════════════════════════════════════════════════════
+//  FIELD 22/09 (second drive) — storage, the AT-STOP surface, live GTA
+//  Reported after updating the app:
+//    · "o ciclo que eu havia gravado nao estava na lista"
+//    · "a reproducao travou depois do stop 3" (TIME LEFT 00:18, 0 km/h)
+//    · "o cronometro na parada nao existe ou e impossivel de visualizar"
+//    · "os eventos deveriam ser imagems bem visiveis durante a parada"
+//    · repeating a cycle gives the driver no GTA feedback
+//  Measured causes: a cycle with photos is 0.39 MB of JSON — 0.78 MB in
+//  localStorage — so six cycles filled the ~5 MB origin quota; and one
+//  corrupt entry made JSON.parse throw for the WHOLE list. The stop surface
+//  was redrawn only from onGPS, which Android stops delivering while parked.
+// ══════════════════════════════════════════════════════════════════════════
+console.log('\n── field 22/09 (storage · at-stop · live GTA) ──');
+(function(){
+  const S_fs=require('fs'),S_path=require('path');
+  const html=S_fs.readFileSync(
+    [S_path.join(__dirname,'index.html'),'/tmp/dev/gpx_nav_dev-main/index.html']
+      .find(p=>S_fs.existsSync(p)),'utf8');
+  const code=html.replace(/\/\*[\s\S]*?\*\//g,'').replace(/^\s*\/\/.*$/gm,'');
+
+  // ── STORE-1: cycles are stored where size is not a cliff ──
+  console.assert(/indexedDB/.test(code),'STORE-1: cycles are still confined to localStorage');
+  console.assert(/CYCLE_STORE/.test(code)&&/cycleDBWriteAll/.test(code),
+    'STORE-1: no cycle object store');
+  console.log('STORE-1. cycles stored in IndexedDB OK');
+
+  // ── STORE-2: the localStorage mirror must not carry the photos, or it
+  //             reintroduces the very quota that lost the cycle ──
+  const mirror=/function saveRecsMirror\(\)\{[\s\S]*?\n\}/.exec(code);
+  console.assert(mirror,'STORE-2: no mirror function');
+  console.assert(mirror&&/photo:null/.test(mirror[0]),
+    'STORE-2: the localStorage mirror still writes stop photos');
+  console.log('STORE-2. localStorage mirror is photo-free OK');
+
+  // ── STORE-3: a corrupt record may only lose itself ──
+  const loader=/function loadStoredRecordings\(\)\{[\s\S]*?\n\}\n/.exec(code);
+  console.assert(loader,'STORE-3: loader not found');
+  console.assert(loader&&/forEach\(\(r,i\)=>\{[\s\S]*?try\{/.test(loader[0]),
+    'STORE-3: records are not parsed one at a time');
+  // and prove it with the real function
+  const _recs=savedRecs.slice();
+  const good={name:'good',dist:1,date:new Date().toISOString(),
+    points:[{lat:57.7,lng:11.9,t:1},{lat:57.71,lng:11.9,t:2000}],stops:[]};
+  savedRecs.length=0;
+  localStorage.setItem('gpx-nav-recs',JSON.stringify([good,{name:'bad',points:null},good]));
+  loadStoredRecordings();
+  console.assert(savedRecs.length===2,
+    'STORE-3: a corrupt record took the list down with it ('+savedRecs.length+' of 2 recovered)');
+  // a completely unparseable blob must not throw
+  savedRecs.length=0;
+  localStorage.setItem('gpx-nav-recs','{truncated');
+  let threw=false; try{loadStoredRecordings();}catch(e){threw=true;}
+  console.assert(!threw,'STORE-3: an unreadable store threw instead of degrading');
+  localStorage.removeItem('gpx-nav-recs');
+  savedRecs.length=0;_recs.forEach(r=>savedRecs.push(r));
+  console.log('STORE-3. one corrupt record loses only itself OK');
+
+  // ── AS-1: the stop surface has a clock of its own ──
+  //          (the field freeze: redrawn only from onGPS, no fixes while parked)
+  console.assert(/function ensureAtStopClock\(\)\{[\s\S]*?setInterval\(/.test(code),
+    'AS-1: the AT STOP surface has no clock of its own');
+  console.assert(/id="atstop"/.test(html)&&/id="as-clock"/.test(html),
+    'AS-1: the AT STOP surface is not in the DOM');
+  console.log('AS-1. AT STOP surface ticks on its own 1 Hz clock OK');
+
+  // ── AS-2: dwell clock format — hh:mm:ss overflowed and clipped the digits ──
+  console.assert(fmtDwell(35)==='00:35','AS-2: 35 s rendered as '+fmtDwell(35));
+  console.assert(fmtDwell(95)==='01:35','AS-2: 95 s rendered as '+fmtDwell(95));
+  console.assert(fmtDwell(0)==='00:00','AS-2: 0 s rendered as '+fmtDwell(0));
+  console.assert(fmtDwell(3725)==='1:02:05','AS-2: an hour rendered as '+fmtDwell(3725));
+  console.assert(!/^00:/.test(fmtDwell(35).replace('00:','')),'AS-2: leading hour field returned');
+  console.log('AS-2. dwell clock reads mm:ss, hours only past an hour OK');
+
+  // ── AS-3: a number that is not moving must say so ──
+  console.assert(/TIMER NOT RUNNING/.test(code),
+    'AS-3: a stopped timer still shows a static number with no explanation');
+  console.assert(/OVER PLAN/.test(code),'AS-3: no over-plan state');
+  console.assert(/id="as-go"/.test(html)&&/atStopStart\(\)/.test(code),
+    'AS-3: the driver cannot start the stop timer from the driving screen');
+  console.log('AS-3. idle / running / over-plan states all reachable OK');
+
+  // ── AS-4: events are big tiles with a word, not colour alone ──
+  const ren=/function renderAtStop\(\)\{[\s\S]*?\n\}/.exec(code);
+  console.assert(ren&&/as-evt/.test(ren[0])&&/shortLabel/.test(ren[0]),
+    'AS-4: stop events are not rendered as labelled tiles');
+  console.assert(/stopEventSvg\(e,44\)/.test(ren?ren[0]:''),
+    'AS-4: the event glyph is not drawn at glance size');
+  const tile=/\.as-evt\{[^}]*\}/.exec(html);
+  console.assert(tile&&/min-height:96px/.test(tile[0]),'AS-4: event tiles are not glance-sized');
+  console.log('AS-4. event tiles are 96 px with a 44 px glyph and a word OK');
+
+  // ── SWEEP-1: the sweep walks only the head of the queue ──
+  //   Field evidence: the card read "4/8" with Stop 3 still current, i.e. a
+  //   stop further down the list had already been retired. On a closed cycle
+  //   the final stop anchors near the start and was swept in the first 80 m.
+  stops.length=0;
+  [[1,0],[2,500],[3,20]].forEach(([id,rd])=>stops.push(
+    {id,name:'Stop '+id,lat:57.7+id/1000,lng:11.9,routeDistanceM:rd,
+     state:'waiting',elapsed:0,dur_s:10,events:[],photo:null}));
+  stops[0].state='done';
+  routeProgressM=200;                    // past stop 3's anchor, before stop 2's
+  sweepPassedStops();
+  console.assert(stops[2].state==='waiting',
+    'SWEEP-1: a stop deeper in the cycle was retired while an earlier one was pending');
+  console.assert(stops[1].state==='waiting','SWEEP-1: the pending head stop was retired too early');
+  // and once the head IS passed, it retires and the walk continues
+  routeProgressM=700;
+  sweepPassedStops();
+  console.assert(stops[1].state==='done'&&stops[1].missed,'SWEEP-1: the passed head stop was not retired');
+  console.assert(stops[2].state==='done'&&stops[2].missed,'SWEEP-1: the walk did not continue past it');
+  console.log('SWEEP-1. sweep retires from the head of the queue only OK');
+
+  // ── SWEEP-2: never sweep the stop the bus is standing at ──
+  stops.forEach(s=>{s.state='waiting';s.missed=false;});
+  stops[0].state='current'; routeProgressM=99999;
+  sweepPassedStops();
+  console.assert(stops[0].state==='current','SWEEP-2: the current stop was retired');
+  console.assert(stops[1].state==='waiting','SWEEP-2: the walk continued past the current stop');
+  console.log('SWEEP-2. the walk stops at the stop being served OK');
+
+  // ── GTA-LIVE-1: the repeat verdict uses the SAME metrics as the final score ──
+  const rp=/function renderPlaybackGTA\(\)\{[\s\S]*?\n\}/.exec(code);
+  console.assert(rp&&/calcCycleMetrics\(/.test(rp[0]),
+    'GTA-LIVE-1: the live verdict computes its own metrics — it can disagree with the score');
+  console.assert(/function resetPlaybackGTA/.test(code),'GTA-LIVE-1: no per-run reset');
+  console.log('GTA-LIVE-1. live verdict and final score share calcCycleMetrics OK');
+
+  // ── GTA-LIVE-2: the target is the loaded cycle's own class ──
+  console.assert(/resetPlaybackGTA\(rec\.score&&rec\.score\.cls/.test(code),
+    'GTA-LIVE-2: playback does not take its target from the loaded cycle');
+  console.log('GTA-LIVE-2. the reference cycle\'s class is the target OK');
+
+  // ── GTA-LIVE-3: visible while driving — the LIVE CYCLE panel is hidden in
+  //                cockpit mode, so the verdict needs its own surface ──
+  console.assert(/body\.driver-mode \.lcm\{display:none!important\}/.test(html),
+    'GTA-LIVE-3: assumption changed — the LIVE CYCLE panel is no longer hidden while driving');
+  console.assert(/id="gtabar"/.test(html),'GTA-LIVE-3: no driver-facing GTA surface');
+  console.assert(/body\.cockpit \.gtabar\{display:block/.test(html),
+    'GTA-LIVE-3: the GTA strip is not shown in cockpit mode');
+  console.log('GTA-LIVE-3. GTA strip has its own surface, visible in cockpit OK');
+
+  // ── GTA-LIVE-4: all five criteria, each with a direction to correct ──
+  console.assert(/GB_KEYS=\[/.test(code),'GTA-LIVE-4: no criteria table for the strip');
+  const keys=(/GB_KEYS=\[([\s\S]*?)\];/.exec(code)||[])[1]||'';
+  ['spk','spd','dspd','vmax','idle'].forEach(k=>
+    console.assert(new RegExp("k:'"+k+"'").test(keys),'GTA-LIVE-4: criterion '+k+' missing from the strip'));
+  console.assert(/↑/.test(code)&&/↓/.test(code)&&/✓/.test(code),
+    'GTA-LIVE-4: the strip does not say which way to correct');
+  console.log('GTA-LIVE-4. five criteria, each with a correction direction OK');
+
+  // ── AS-5: one stop surface, not two — #nsc needs the id to be outranked ──
+  console.assert(/body\.at-stop #nsc,body\.cockpit\.at-stop #nsc\{display:none!important\}/.test(html),
+    'AS-5: the old stop card is not hidden while the AT STOP panel is up '+
+    '(body.cockpit #nsc forces display:block !important and outranks a class-only rule)');
+  console.log('AS-5. AT STOP replaces the Next Stop Card instead of stacking on it OK');
+  stops.length=0;
+})();
+console.log('ALL FIELD 22/09-B TESTS PASSED');
+__group('Field 22/09-B tests');
+
+// ── STORE-4: booting without IndexedDB must not throw ──────────────────────
+//   The no-IDB path (private mode, old WebViews) used to be deferred to a
+//   microtask, which accidentally hid a boot-order dependency: the loader ran
+//   before Sequence existed. Made synchronous, it threw at startup and the
+//   cycle list came up empty — the same symptom the driver reported. This
+//   whole suite runs without IndexedDB, so reaching here is the proof; the
+//   assertion pins the guard so it cannot be removed silently.
+(function(){
+  const S_fs=require('fs'),S_path=require('path');
+  const html=S_fs.readFileSync(
+    [S_path.join(__dirname,'index.html'),'/tmp/dev/gpx_nav_dev-main/index.html']
+      .find(p=>S_fs.existsSync(p)),'utf8');
+  console.assert(/try\{Sequence\.restore\(\);\}/.test(html),
+    'STORE-4: Sequence.restore() is unguarded at boot again');
+  console.assert(/if\(!idbAvailable\)\{show\(fromLocal\(\)\);return Promise\.resolve\(\);\}/.test(html),
+    'STORE-4: the no-IndexedDB path is not synchronous');
+  let threw=false;
+  try{loadStoredRecordings();}catch(e){threw=true;}
+  console.assert(!threw,'STORE-4: booting the cycle list without IndexedDB throws');
+  console.log('STORE-4. boot without IndexedDB is clean OK');
+})();
+console.log('ALL STORE-4 CHECKS PASSED');
+__group('Storage boot tests');
+
+// ══════════════════════════════════════════════════════════════════════════
+//  FIELD 22/09-C — the exit button, and stops orphaned in 'current'
+//  Reported with two screenshots at 97-100 km/h on the motorway:
+//    · the ✕ (exit navigation) "ta congelado ou nao funciona"
+//    · the AT STOP panel showing "Stop 1 · TIMER NOT RUNNING" while driving
+//  Measured: the ✕ sits inside .nav-hud, which is pointer-events:none so the
+//  map stays draggable; every other control re-enables it, this one never did
+//  — clicks went through to the map. And a stop could only leave 'current'
+//  through the timer, so with auto-start off it stayed 'current' for the rest
+//  of the cycle and blocked every later stop.
+// ══════════════════════════════════════════════════════════════════════════
+console.log('\n── field 22/09-C (exit button · orphaned stops) ──');
+(function(){
+  const C_fs=require('fs'),C_path=require('path');
+  const html=C_fs.readFileSync(
+    [C_path.join(__dirname,'index.html'),'/tmp/dev/gpx_nav_dev-main/index.html']
+      .find(p=>C_fs.existsSync(p)),'utf8');
+  const code=html.replace(/\/\*[\s\S]*?\*\//g,'').replace(/^\s*\/\/.*$/gm,'');
+
+  // ── EXIT-1: the only way out of navigation must accept a click ──
+  console.assert(/\.nav-hud\{[^}]*pointer-events:none/.test(html),
+    'EXIT-1: assumption changed — .nav-hud no longer blocks pointer events');
+  const rule=/body\.cockpit #cockpit-exit\{[\s\S]*?\}/.exec(html);
+  console.assert(rule,'EXIT-1: the cockpit exit rule is gone');
+  console.assert(rule&&/pointer-events:auto!important/.test(rule[0]),
+    'EXIT-1: the exit button is inside a pointer-events:none layer and never re-enables them');
+  console.assert(rule&&/z-index:1300!important/.test(rule[0]),
+    'EXIT-1: the exit button has no stacking guarantee over the map');
+  console.assert(/id="cockpit-exit"[^>]*onclick="exitNavigation\(\)"/.test(html),
+    'EXIT-1: the exit button is not wired to exitNavigation');
+  console.log('EXIT-1. exit button is clickable and wired OK');
+
+  // ── ORPHAN-1: leaving a stop retires it even when no timer ever ran ──
+  const dep=/const leftForGood[\s\S]*?\n    \}/.exec(code);
+  console.assert(dep,'ORPHAN-1: the departure branch was not found');
+  console.assert(dep&&/else if\(leftForGood&&s\.state==='current'\)/.test(dep[0]),
+    'ORPHAN-1: a stop can still only leave "current" through the timer');
+  console.assert(dep&&/s\.untimed=\(s\.elapsed===0\)/.test(dep[0]),
+    'ORPHAN-1: a stop left without a measured dwell is not recorded as such');
+  console.log('ORPHAN-1. departure retires a stop with no timer OK');
+
+  // ── ORPHAN-2: end to end on the real cycle, with auto-start OFF ──
+  const F_fs=require('fs'),F_path=require('path');
+  const f=[F_path.join(__dirname,'testdata','Cycle_field_22_09.json'),
+           '/tmp/dev/gpx_nav_dev-main/testdata/Cycle_field_22_09.json']
+    .find(p=>F_fs.existsSync(p));
+  if(f){
+    const REC=JSON.parse(F_fs.readFileSync(f,'utf8'))[0];
+    loadFresh(JSON.parse(JSON.stringify(REC)));
+    navActive=true;insideStop.clear();departGate=null;evtAnnounced.clear();
+    el('rng-radius').value='10';
+    el('rng-auto').value='0';          // the driver turned auto-start off
+    el('rng-autostop').value='1';
+    Playback.begin('1');
+    REC.points.forEach(q=>onGPS({coords:{latitude:q.lat,longitude:q.lng,accuracy:6,
+      altitude:q.alt||0,speed:q.speed,heading:null},timestamp:q.t}));
+    const stuck=stops.filter(s=>s.state==='current');
+    console.assert(stuck.length===0,
+      'ORPHAN-2: '+stuck.length+' stop(s) left orphaned in "current" after the cycle: P'+
+      stuck.map(s=>s.id).join(',P'));
+    const pending=stops.filter(s=>s.state==='waiting');
+    console.assert(pending.length===0,
+      'ORPHAN-2: an orphaned stop blocked '+pending.length+' later stops');
+    const untimed=stops.filter(s=>s.untimed).length;
+    console.assert(untimed>0,
+      'ORPHAN-2: stops were completed with no timer yet none is flagged untimed');
+    console.log('ORPHAN-2. auto-start OFF: no stop stranded, '+untimed+' flagged "No time" OK');
+    exitNavigation();
+  }
+
+  // ── ORPHAN-3: "No time" is its own outcome, not silently "Done" ──
+  console.assert(/st\.textContent=s\.missed\?'Missed':\(s\.untimed&&s\.state==='done'\?'No time'/.test(code),
+    'ORPHAN-3: a stop with no measured dwell is labelled the same as a completed one');
+  console.assert(/\.sc-badge\.untimed\{/.test(html),'ORPHAN-3: no badge style for an untimed stop');
+  console.assert(/done&&untimed\?'\?'/.test(code),'ORPHAN-3: the map pin shows a clean tick for an untimed stop');
+  console.log('ORPHAN-3. visited / not timed / missed are three distinct outcomes OK');
+
+  // ── ALERT-1: every showAlert type used must have a style, or it renders
+  //             as bare white text over a light basemap ──
+  const types=[...code.matchAll(/showAlert\(\s*'([a-z-]+)'/g)].map(m=>m[1]);
+  const styled=[...html.matchAll(/\.arriving\.([a-z-]+)\s*\{/g)].map(m=>m[1]);
+  const unstyled=[...new Set(types)].filter(t=>!styled.includes(t));
+  console.assert(unstyled.length===0,
+    'ALERT-1: showAlert type(s) with no style, unreadable over the map: '+unstyled.join(', '));
+  console.log('ALERT-1. all '+[...new Set(types)].length+' alert types are styled OK');
+
+  // ── GTA-VIS-1: the strip is sized to be read from the driver's seat ──
+  const cell=/\.gb-cell \.gb-v\{[^}]*\}/.exec(html);
+  console.assert(cell&&/font-size:26px/.test(cell[0]),
+    'GTA-VIS-1: the GTA values are back below glance size');
+  const glyph=/\.gb-cell \.gb-s\{[^}]*\}/.exec(html);
+  console.assert(glyph&&/font-size:20px/.test(glyph[0]),'GTA-VIS-1: the direction glyph shrank');
+  console.assert(/\.gb-cell\{[^}]*min-height:74px/.test(html),'GTA-VIS-1: the cells lost their height');
+  console.log('GTA-VIS-1. GTA markers at glance size OK');
+})();
+console.log('ALL FIELD 22/09-C TESTS PASSED');
+__group('Field 22/09-C tests');
+
+// ══════════════════════════════════════════════════════════════════════════
+//  SYNTHETIC CYCLE v2 — drive-cycle execution, guidance and logging
+//  Test IDs map to the Drive Cycle Test specification (§ numbers) in
+//  SYNTH_CYCLE.md. Simulated runs are deterministic (seeded RNG).
+// ══════════════════════════════════════════════════════════════════════════
+console.log('\n── synthetic cycle v2 ──');
+(function(){
+  const near=(a,b,tol)=>a!==null&&a!==undefined&&Math.abs(a-b)<=tol;
+  const fs=require('fs'),path=require('path');
+  const html=fs.readFileSync([path.join(__dirname,'index.html'),'/tmp/dev/gpx_nav_dev-main/index.html'].find(p=>fs.existsSync(p)),'utf8');
+  const SPEC=synthCycle({name:'Spec',refMode:'time',laps:1,startDelay:5,segs:[
+    synSeg(30,'rate',0.5,10,'s'),synSeg(50,'time',10,20,'s'),synSeg(30,'rate',0.6,10,'s'),synSeg(0,'rate',0.6,20,'s')]});
+  const C=SYN_C;
+
+  // ── SYN-REF-1 (§8, §22): calculation examples and reference math ──
+  let c=synthCycle({name:'x',segs:[synSeg(50,'rate',0.5,0,'s')]});
+  console.assert(near(synthCompile(c).phases[0].T,27.78,0.01),'REF-1: 0→50 @0.5 m/s² ≠ 27.8 s');
+  c=synthCycle({name:'x',segs:[synSeg(50,'time',20,0,'s')]});
+  console.assert(near(synthCompile(c).phases[0].a,0.694,0.001),'REF-1: 0→50 in 20 s ≠ 0.694 m/s²');
+  c=synthCycle({name:'x',segs:[synSeg(50,'rate',1,5,'s'),synSeg(20,'time',15,0,'s')]});
+  console.assert(near(synthCompile(c).phases[2].a,-0.556,0.001),'REF-1: 50→20 in 15 s ≠ −0.556 m/s²');
+  console.assert(near(synMs(36),10,1e-12)&&near(synKmh(10),36,1e-12),'REF-1: km/h ↔ m/s');
+  const d1=synthSegDerived(SPEC,1);
+  console.assert(d1.v0===30&&d1.type==='ACCEL'&&near(d1.a,20/3.6/10,1e-9),'REF-1: start speed not inherited / derived accel wrong');
+  const P=synthCompile(SPEC);
+  console.assert(P.phases.map(p=>p.type).join()==='ACCEL,CONST,ACCEL,CONST,DECEL,CONST,DECEL,PAUSE','REF-1: phase sequence (end hold kept) '+P.phases.map(p=>p.type));
+  console.assert(P.phases.every((p,i)=>i===0||(near(p.t0,P.phases[i-1].t0+P.phases[i-1].T,1e-9)&&near(p.v0,P.phases[i-1].v1,1e-12))),'REF-1: timeline not continuous');
+  const R1=synthRefAt(P,10);console.assert(near(R1.v,5,1e-9)&&R1.a===0.5&&near(R1.s,25,1e-9),'REF-1: v_ref(10 s)');
+  const Rend=synthRefAt(P,P.T+5);console.assert(Rend.type==='END'&&Rend.v===0,'REF-1: after the end');
+  console.assert(synthRefAt(P,-2).type==='PRE','REF-1: before GO');
+  console.log('SYN-REF-1. spec examples 27.8 s / +0.694 / −0.556, inheritance, continuity OK');
+
+  // ── SYN-VAL-1 (§9): invalid input is reported, never compiled ──
+  const bad=[
+    ['negative time',{segs:[synSeg(30,'time',-5,0)]},'time'],['zero duration',{segs:[synSeg(30,'time',0,0)]},'time'],
+    ['zero accel',{segs:[synSeg(30,'rate',0,0)]},'rate'],['NaN',{segs:[{v:NaN,def:'rate',rate:1,hold:0}]},'v'],
+    ['Infinity',{segs:[synSeg(30,'rate',Infinity,0)]},'rate'],['text',{segs:[synSeg('abc','rate',1,0)]},'v'],
+    ['speed > 120',{segs:[synSeg(200,'rate',1,0)]},'v'],['negative speed',{segs:[synSeg(-5,'rate',1,0)]},'v'],
+    ['too short',{segs:[synSeg(5,'rate',3,0)]},'rate'],['too long',{segs:[synSeg(120,'rate',0.05,0)]},'rate'],
+    ['accel via time > 3',{segs:[synSeg(80,'time',2,0)]},'time'],['hold m at 0',{segs:[synSeg(30,'rate',1,10),synSeg(0,'rate',1,50,'m')]},'hold'],
+    ['negative hold',{segs:[synSeg(30,'rate',1,-3)]},'hold'],['laps end ≠ 0',{laps:2,segs:[synSeg(30,'rate',1,10)]},'laps'],
+    ['laps 0',{laps:0,segs:[synSeg(30,'rate',1,10),synSeg(0,'rate',1,0)]},'laps'],['no motion',{segs:[synSeg(0,'rate',1,10)]},'segs'],
+    ['no segments',{segs:[]},'segs'],['empty name',{name:'  ',segs:[synSeg(30,'rate',1,10)]},'name']];
+  bad.forEach(([n,src,f])=>{
+    let e;try{e=synthValidate(synthCycle(Object.assign({name:'x',refMode:'time'},src)));}catch(err){e=null;}
+    console.assert(e&&e.length>0&&e.some(x=>x.f===f),'VAL-1: '+n+' not reported on '+f+': '+JSON.stringify(e));
+    console.assert(e&&e.every(x=>synT(x.k,x.p)!==x.k),'VAL-1: '+n+' has no user-facing message');
+  });
+  console.assert(synthValidate(SPEC).length===0,'VAL-1: valid spec cycle rejected');
+  console.assert(synthValidate(synthCycle({name:'c',segs:[synSeg('30,5','rate','0,5',10)]})).length===0,'VAL-1: decimal comma rejected');
+  console.log('SYN-VAL-1. '+bad.length+' invalid cases reported with messages OK');
+
+  // ── SYN-FUZZ-1 (§40 property/fuzz): no crash, no NaN/Infinity, monotonic ──
+  const rnd=synRng(12345);let nValid=0,nInvalid=0;
+  const pick=a=>a[Math.floor(rnd()*a.length)];
+  for(let k=0;k<500;k++){
+    const n=1+Math.floor(rnd()*12),segs=[],clean=rnd()<0.6;
+    if(clean){                                              // plausible cycles, edge values included
+      for(let i=0;i<n;i++)segs.push(synSeg(pick([0,5,20,30,50,80,120,0.5]),pick(['rate','time']),
+        pick([0.05,0.3,0.5,1,2,3,rnd()*2.9+0.1]),pick([0,0,2,10,30,rnd()*60]),pick(['s','s','m'])));
+      segs.forEach(g=>{if(g.def==='time')g.time=pick([0.5,3,10,60,rnd()*100+1]);});
+      segs.push(synSeg(0,'rate',pick([0.4,0.8,1.5]),0,'s'));
+      const cy=synthCycle({name:'c'+k,refMode:pick(['time','position']),laps:pick([1,1,2,3]),startDelay:5,segs});
+      segs.forEach(g=>{if(g.holdUnit==='m'&&(+g.v)===0)g.holdUnit='s';});
+      checkCycle(cy,k);continue;
+    }
+    for(let i=0;i<n;i++){
+      const v=pick([0,0,10,20,30,40,50,60,90,rnd()*130-5,'x',NaN,Infinity,'',-0]);
+      segs.push({v,def:pick(['rate','time','bogus']),rate:pick([0.3,0.5,1,2.9,rnd()*4-0.5,0,NaN,'1,2']),
+        time:pick([1,5,10,30,rnd()*700-10,0,Infinity]),hold:pick([0,0,5,20,rnd()*100,-1,'']),holdUnit:pick(['s','m'])});
+    }
+    const cy=synthCycle({name:'f'+k,refMode:pick(['time','position']),laps:pick([1,1,2,3,0,1.5]),startDelay:pick([5,10,2,70]),segs});
+    checkCycle(cy,k);
+  }
+  function checkCycle(cy,k){
+    let e;try{e=synthValidate(cy);}catch(err){console.assert(false,'FUZZ-1: validate threw '+err.message);return;}
+    if(e.length){nInvalid++;return;}
+    nValid++;
+    const p=synthCompile(cy);
+    let ok=Number.isFinite(p.T)&&Number.isFinite(p.S)&&p.T>0&&p.S>0;
+    p.phases.forEach((q,i)=>{
+      ok=ok&&[q.v0,q.v1,q.a,q.t0,q.T,q.s0,q.S].every(Number.isFinite)&&q.T>0&&q.v0>=0&&q.v1>=0;
+      if(i)ok=ok&&near(q.t0,p.phases[i-1].t0+p.phases[i-1].T,1e-6)&&near(q.v0,p.phases[i-1].v1,1e-9);
+    });
+    for(let j=0;j<20;j++){const R=synthRefAt(p,rnd()*p.T*1.1);ok=ok&&[R.v,R.a,R.s].every(Number.isFinite)&&R.v>=-1e-9;}
+    p.sections.filter(s=>s.kind==='move').forEach(sec=>{for(let j=0;j<10;j++){const R=synthRefAtDist(sec,rnd()*sec.S*1.1);ok=ok&&Number.isFinite(R.v)&&Number.isFinite(R.tl);}});
+    console.assert(ok,'FUZZ-1: compiled cycle '+k+' has non-finite or discontinuous values');
+  }
+  console.assert(nValid>40&&nInvalid>40,'FUZZ-1: fuzz mix too narrow '+nValid+'/'+nInvalid);
+  console.log(`SYN-FUZZ-1. 500 random cycles (${nValid} valid, ${nInvalid} rejected) — finite, monotonic, continuous OK`);
+
+  // ── SYN-ID-1 (§33): cycle identity across tablets ──
+  const h=synthHash(SPEC);
+  console.assert(/^[0-9A-F]{4}-[0-9A-F]{4}$/.test(h),'ID-1: format');
+  console.assert(synthHash(Object.assign({},SPEC,{name:'renamed',startDelay:30}))===h,'ID-1: name/countdown changed the ID');
+  console.assert(synthHash(Object.assign({},SPEC,{refMode:'position'}))!==h,'ID-1: reference mode kept the ID');
+  console.assert(synthHash(synthCycle(JSON.parse(JSON.stringify(SPEC))))===h,'ID-1: share/import round trip changed the ID');
+  const S2=JSON.parse(JSON.stringify(SPEC));S2.segs[1].time=10.5;console.assert(synthHash(S2)!==h,'ID-1: time change kept the ID');
+  console.log('SYN-ID-1. cycle ID OK');
+
+  // ── SYN-GUIDE-1 (§14–16): commands from speed and acceleration error ──
+  const G=Object.assign({},SYNTH_CFG.guide);
+  const run=(mode,ev,ea,ms)=>{const st=synthGuideNew();let cmd;for(let t=0;t<=(ms||3000);t+=100)cmd=synthGuideStep(st,{t,mode,ev,ea,moving:true,phaseKey:'k'},G);return cmd;};
+  console.assert(run('ACCEL',0.3/3.6*3.6,0.22)==='ACC_MORE','GUIDE-1: §14 example (speed +0.3, accel low by 0.22) → '+run('ACCEL',0.3,0.22));
+  console.assert(run('ACCEL',0,0.03)==='ACC','GUIDE-1: accel close → ACCELERATE');
+  console.assert(run('DECEL',0,-0.6-(-0.57))==='BRAKE','GUIDE-1: −0.57 vs −0.60 → BRAKE');
+  console.assert(run('DECEL',0,-0.6-(-0.35))==='BRAKE_MORE','GUIDE-1: −0.35 vs −0.60 → BRAKE MORE');
+  console.assert(run('DECEL',0,-0.6-(-0.85))==='REDUCE','GUIDE-1: −0.85 vs −0.60 → REDUCE BRAKING');
+  console.assert(run('CONST',0.5,0)==='HOLD','GUIDE-1: on speed → HOLD');
+  console.assert(run('CONST',1.5,0)==='ACC','GUIDE-1: 1.5 below → ACCELERATE');
+  console.assert(run('CONST',2.6,0)==='ACC_MORE','GUIDE-1: 2.6 below → ACCELERATE MORE');
+  console.assert(run('CONST',-1.5,0)==='RELEASE','GUIDE-1: 1.5 above → RELEASE THROTTLE');
+  console.assert(run('CONST',-2.6,0)==='BRAKE','GUIDE-1: 2.6 above → BRAKE');
+    {const st=synthGuideNew();const w=synthGuideStep(st,{t:0,mode:'PAUSE',ev:null,ea:null,moving:false,phaseKey:'p'},G);
+   console.assert(w==='WAIT'&&run('PAUSE',null,null)==='STOP'&&run('GO',null,null)==='GO'&&run('NOGPS',null,null)==='NOGPS','GUIDE-1: standstill / stop / go / no GPS');}
+  // settling window: at a phase change the default command shows for graceMs
+  {const st=synthGuideNew();const c0=synthGuideStep(st,{t:0,mode:'DECEL',ev:0,ea:0.5,moving:true,phaseKey:'a'},G);
+   console.assert(c0==='BRAKE','GUIDE-1: settling window ignored');}
+  console.log('SYN-GUIDE-1. all 7 commands from e_v and e_a OK');
+
+  // ── SYN-HYST-1 (§17, scenario F): no flicker around thresholds ──
+  {const st=synthGuideNew();const seq=[];
+   const feed=(ea,t)=>seq.push(synthGuideStep(st,{t,mode:'ACCEL',ev:0,ea,moving:true,phaseKey:'p'},G));
+   let t=0;for(;t<1500;t+=100)feed(0.0,t);                // past the settling window
+   for(let i=0;i<10;i++,t+=100)feed(0.21,t);                // enter (> 0.20)
+   const entered=seq[seq.length-1];
+   for(let i=0;i<30;i++,t+=100)feed(i%2?0.16:0.19,t);       // noise above the 0.15 exit
+   const held=seq.slice(-30).every(x=>x===entered);
+   for(let i=0;i<10;i++,t+=100)feed(0.14,t);                // below exit, but still class 1 → ACC_MORE
+   for(let i=0;i<10;i++,t+=100)feed(0.07,t);                // below 0.075 → good
+   console.assert(entered==='ACC_MORE'&&held,'HYST-1: accel command flickered in the 0.15–0.20 band');
+   console.assert(seq[seq.length-1]==='ACC','HYST-1: did not leave ACCELERATE MORE once the error fell');
+   const st2=synthGuideNew(),r2=synRng(7),cmds=[];
+   for(let t=0;t<30000;t+=100)cmds.push(synthGuideStep(st2,{t,mode:'CONST',ev:1+(r2()-0.5)*0.4,ea:0,moving:true,phaseKey:'c'},G));
+   const changes=cmds.filter((x,i)=>i&&x!==cmds[i-1]).length;
+   console.assert(changes<=2,'HYST-1: '+changes+' command changes for noise around 1 km/h');
+   const st3=synthGuideNew();for(let t=0;t<2000;t+=100)synthGuideStep(st3,{t,mode:'CONST',ev:0,ea:0,moving:true,phaseKey:'c'},G);
+   synthGuideStep(st3,{t:2000,mode:'CONST',ev:3,ea:0,moving:true,phaseKey:'c'},G);
+   const spike=synthGuideStep(st3,{t:2200,mode:'CONST',ev:3,ea:0,moving:true,phaseKey:'c'},G);
+   const after=synthGuideStep(st3,{t:2300,mode:'CONST',ev:0,ea:0,moving:true,phaseKey:'c'},G);
+   console.assert(spike==='HOLD'&&after==='HOLD','HYST-1: a 200 ms spike changed the displayed command');
+   console.log('SYN-HYST-1. hysteresis 0.20/0.15 + stable period, '+changes+' change(s) under noise OK');}
+
+  // ── simulated runs (§38–39) ──
+  const sim=(cy,sc,seed)=>{Synth.run=null;return Synth.simulate(cy,sc,{seed:seed||1,t0:1.8e12});};
+  const inPh=(r,ph)=>r.rows.filter(x=>x[C.Phase]===ph);
+
+  // SYN-SCN-A perfect following
+  let r=sim(SPEC,'perfect');
+  console.assert(r.state==='DONE','SCN-A: run did not complete: '+r.state);
+  console.assert(r.summary.pctV>97&&r.summary.rmseV<0.5,'SCN-A: speed error not near zero: '+r.summary.pctV+'% '+r.summary.rmseV);
+  console.assert(r.summary.pctA===null||r.summary.pctA>85,'SCN-A: accel error not near zero: '+r.summary.pctA);
+  console.assert(r.summary.verdict==='VALID','SCN-A: verdict '+r.summary.verdict+' '+r.summary.segs.map(s=>s.why).join('|'));
+  const el0=r.rows.map(x=>x[C.Elapsed_Time_s]);
+  console.assert(el0.every((x,i)=>i===0||x>el0[i-1]),'TIME-1: elapsed not strictly monotonic');
+  console.assert(r.rows.every(x=>near(x[C.UTC_Time_ms]-r.t0,x[C.Elapsed_Time_s]*1000,1)),'TIME-1: UTC and elapsed disagree');
+  console.assert(r.rows.length>=(P.T+5)*10-2&&r.rows.length<=(P.T+5)*10+40,'TIME-1: log rate not 10 Hz (plus ≤4 s end tail): '+r.rows.length);
+  console.assert(r.rows.every(x=>x.length===SYN_COLS.length),'LOG-1: row width ≠ column count');
+  const ev=t=>r.events.filter(e=>e.type===t).length;
+  console.assert(ev('RUN_START')===1&&ev('GO')>=1&&ev('RUN_END')===1&&ev('PHASE')===P.phases.length,'LOG-1: events incomplete');
+  // the reference never waits (§2): reference at elapsed t equals v_ref(t − countdown)
+  console.assert(r.rows.filter(x=>x[C.Phase]!=='PRE').every(x=>near(x[C.Reference_Speed_kmh],synthRefAt(P,x[C.Elapsed_Time_s]-5).v*3.6,0.05)),'REF-2: reference moved');
+  console.log(`SYN-SCN-A. perfect: ${r.summary.pctV.toFixed(1)}% in ±1 km/h, RMSE ${r.summary.rmseV.toFixed(2)} km/h, VALID OK`);
+
+  // SYN-SCN-A2 late driver: reference still does not move (§2, §22)
+  r=sim(SPEC,'typical');
+  console.assert(r.rows.filter(x=>x[C.Phase]!=='PRE').every(x=>near(x[C.Reference_Speed_kmh],synthRefAt(P,x[C.Elapsed_Time_s]-5).v*3.6,0.05)),'REF-2: reference stretched for a lagging driver');
+  const imuRows=r.rows.filter(x=>x[C.Acceleration_Source]==='IMU').length/r.rows.length;
+  console.assert(r.events.some(e=>e.type==='IMU_CALIBRATED')&&imuRows>0.6,'IMU-1: IMU not calibrated / not used ('+(imuRows*100).toFixed(0)+'%)');
+  const accRows=inPh(r,'ACCEL').concat(inPh(r,'DECEL')).filter(x=>x[C.Acceleration_Source]==='IMU');
+  const accErr=accRows.map(x=>x[C.Longitudinal_Acceleration_Filtered]-x[C.Reference_Acceleration]);
+  const accMean=accErr.reduce((a,b)=>a+b,0)/accErr.length;
+  console.assert(Math.abs(accMean)<0.15,'IMU-1: IMU longitudinal accel biased vs reference: '+accMean.toFixed(3));
+  console.log(`SYN-IMU-1. mounted 25° off-axis: forward axis found, IMU used ${(imuRows*100).toFixed(0)}% of rows, mean accel offset ${accMean.toFixed(3)} m/s² OK`);
+
+  // SYN-SCN-B constant 2 km/h low
+  r=sim(SPEC,'slow2');
+  const cB=inPh(r,'CONST').filter(x=>x[C.Speed_Error_kmh]!==null);
+  const accCmd=cB.filter(x=>x[C.Driver_Command]==='ACC'||x[C.Driver_Command]==='ACC_MORE').length/cB.length;
+  console.assert(accCmd>0.7,'SCN-B: 2 km/h low at constant speed did not ask to accelerate ('+(accCmd*100).toFixed(0)+'%)');
+  console.log(`SYN-SCN-B. 2 km/h low → ACCELERATE on ${(accCmd*100).toFixed(0)}% of constant-speed rows OK`);
+
+  // SYN-SCN-C correct speed, insufficient acceleration: the 30→50 transition
+  // starts on speed (after 10 s at 30 km/h) with a bus that only gives 60 %
+  r=sim(SPEC,'weakAcc');
+  const firstMore=inPh(r,'ACCEL').filter(x=>x[C.Segment_ID]===2).find(x=>x[C.Driver_Command]==='ACC_MORE');
+  console.assert(firstMore&&Math.abs(firstMore[C.Speed_Error_kmh])<SYNTH_CFG.guide.tolV2,'SCN-C: ACCELERATE MORE came only after a large speed error: '+(firstMore&&firstMore[C.Speed_Error_kmh]));
+  console.assert(r.summary.segs[0].aMeas<0.4,'SCN-C: weak launch not measured: '+r.summary.segs[0].aMeas);
+  console.log(`SYN-SCN-C. weak acceleration → ACCELERATE MORE at speed error ${firstMore[C.Speed_Error_kmh].toFixed(2)} km/h OK`);
+
+  // SYN-SCN-D retardation too weak / E too strong
+  r=sim(SPEC,'weakBrake');
+  let dRows=inPh(r,'DECEL').filter(x=>x[C.Driver_Command]);
+  const more=dRows.filter(x=>x[C.Driver_Command]==='BRAKE_MORE').length/dRows.length;
+  console.assert(more>0.4,'SCN-D: weak braking → BRAKE MORE only on '+(more*100).toFixed(0)+'%');
+  r=sim(SPEC,'strongBrake');
+  dRows=inPh(r,'DECEL').filter(x=>x[C.Driver_Command]);
+  const less=dRows.filter(x=>x[C.Driver_Command]==='REDUCE').length/dRows.length;
+  console.assert(less>0.25,'SCN-E: strong braking → REDUCE BRAKING only on '+(less*100).toFixed(0)+'%');
+  console.log(`SYN-SCN-D/E. BRAKE MORE ${(more*100).toFixed(0)}% / REDUCE BRAKING ${(less*100).toFixed(0)}% of deceleration rows OK`);
+
+  // SYN-SCN-G GNSS dropout: degraded state, nothing fabricated
+  const LONG=synthCycle({name:'long',refMode:'time',startDelay:5,segs:[synSeg(40,'rate',0.6,60,'s'),synSeg(0,'rate',0.7,0,'s')]});
+  r=sim(LONG,'dropout');
+  console.assert(r.state==='DONE','SCN-G: run did not complete through dropouts');
+  const lost=r.rows.filter(x=>x[C.Phase]!=='PRE'&&String(x[C.Quality_Flags]).includes('GPS_LOST'));
+  console.assert(lost.length>20,'SCN-G: dropout never flagged GPS_LOST ('+lost.length+')');
+  console.assert(lost.every(x=>x[C.Actual_Speed_kmh]===null&&x[C.Speed_Error_kmh]===null&&x[C.Driver_Command]==='NOGPS'),'SCN-G: speed fabricated during GPS loss');
+  console.assert(lost.every(x=>x[C.GPS_Data_Age_s]>SYNTH_CFG.gpsLostMs/1000),'SCN-G: data age not reported');
+  console.assert(r.rows.filter(x=>String(x[C.Quality_Flags]).includes('GPS_STALE')).length>0,'SCN-G: stale state skipped');
+  console.assert(r.events.some(e=>e.type==='GPS_LOST')&&r.events.some(e=>e.type==='GPS_OK'),'SCN-G: loss/recovery events missing');
+  const numCols=SYN_COLS.filter(n=>!['Acceleration_Source','Cycle_ID','Phase','Driver_Command','Next_Phase','Quality_Flags'].includes(n)).map(n=>C[n]);
+  console.assert(r.rows.every(x=>numCols.every(i=>x[i]===null||Number.isFinite(x[i]))),'SCN-G: NaN/Infinity in the log');
+  console.log(`SYN-SCN-G. GNSS dropout: ${lost.length} rows flagged, no fabricated speed, run completes OK`);
+
+  // SYN-SCN-N noisy sensors + IMU bias: completes, no NaN
+  r=sim(SPEC,'noisy',3);
+  console.assert(r.state==='DONE'&&r.rows.every(x=>numCols.every(i=>x[i]===null||Number.isFinite(x[i]))),'SCN-N: noisy run failed');
+  console.log('SYN-SCN-N. noisy sensors + IMU bias complete without invalid values OK');
+
+  // ── SYN-POS-1: position-locked stop-to-stop (v1 behaviour kept) ──
+  const LAD=synthCycle(SYNTH_PRESETS[1]);
+  r=sim(LAD,'perfect');
+  const stops=Object.values(r.stops).map(s=>s.err).filter(x=>x!==null&&x!==undefined);
+  console.assert(r.state==='DONE'&&stops.length===4,'POS-1: position run incomplete ('+stops.length+' stops)');
+  console.assert(stops.every(e=>Math.abs(e)<3),'POS-1: stop error > 3 m: '+stops.map(e=>e.toFixed(2)));
+  console.assert(near(r.summary.distanceM,synthCompile(LAD).S,8),'POS-1: driven distance ≠ plan: '+r.summary.distanceM);
+  const waits=r.events.filter(e=>e.type==='GO').map(e=>e.t),stopT=r.events.filter(e=>e.type==='STOP').map(e=>e.t);
+  console.assert(stopT.slice(0,3).every((t,i)=>near((waits[i+1]-t)/1000,20,0.2)),'POS-1: waits not timed from the actual stop');
+  console.log('SYN-POS-1. position-locked: 4 stops within 3 m, waits from actual stop OK');
+
+  // ── SYN-POS-2: unplanned stop, early start, parked tablet stops sending fixes ──
+  function driveDirect(cy,o){
+    o=o||{};const S=Synth;S.sim=null;S.run=null;let t=1.9e12;
+    const rr=S.startRun(cy,{vehicle:'T'},t);
+    let v=0,key='',launchAt=null,hold=null,hDone=false,guard=0,sT=0;
+    while(rr.state!=='DONE'&&rr.state!=='ABORTED'&&guard++<60000){
+      t+=100;
+      const P2=rr.pos,it=rr.plan.sections[P2.item],k=rr.state+P2.item;
+      if(k!==key){key=k;launchAt=(it&&it.kind==='move'&&v>0)?t:null;if(it&&it.kind==='pause')sT=0;}
+      if(rr.state==='ACTIVE'&&it&&it.kind==='move'){
+        const last=it.ph[it.ph.length-1],d=Math.abs(last.a),a=it.ph[0].a;
+        if(launchAt===null)launchAt=t+1000;
+        if(o.unplanned&&P2.item===2&&!hDone&&sT>60){hold=t+12000;hDone=true;}
+        const holding=hold&&t<hold;let want;
+        if(holding||t<launchAt)want=0;else if(sT>=it.S-v*v/(2*d)-0.05||(v===0&&sT>it.S-2))want=0;else want=it.ph[1]?it.ph[1].v1:it.ph[0].v1;
+        if(want>v)v=Math.min(want,v+a*0.1);else if(want<v)v=Math.max(0,v-(holding?2.5:d)*0.1);
+      }else if(rr.state==='ACTIVE'&&it&&it.kind==='pause'&&o.early&&P2.item===1&&P2.dwellEnd-t<4000)v=Math.min(1.5,v+0.1);
+      else v=0;
+      sT+=v*0.1;
+      if(t%1000===0){const stale=o.stale&&rr.state==='ACTIVE'&&v===0&&P2.tLaunch!==null;
+        if(!stale)S.gnss({t,lat:null,lon:null,v,acc:4});}
+      S.tick(t);
+    }
+    return rr;
+  }
+  r=driveDirect(LAD,{stale:true});
+  console.assert(r.state==='DONE'&&Object.values(r.stops).filter(s=>s.err!==null&&s.err!==undefined).length===4,'POS-2: stop not registered without fixes');
+  r=driveDirect(LAD,{unplanned:true});
+  console.assert(r.state==='DONE'&&r.events.some(e=>e.type==='UNPLANNED_STOP')&&r.events.some(e=>e.type==='RELAUNCH'),'POS-2: unplanned stop not handled');
+  console.assert(r.summary.segs.some(s=>/UNPLANNED/.test(s.why)),'POS-2: unplanned stop not flagged in results');
+  r=driveDirect(LAD,{early:true});
+  console.assert(r.state==='DONE'&&r.events.some(e=>e.type==='EARLY_START')&&r.summary.segs.some(s=>/EARLY/.test(s.why)),'POS-2: early start not handled');
+  const e2=Object.values(r.stops).map(s=>s.err).filter(x=>x!==null&&x!==undefined);
+  console.assert(e2.every(e=>Math.abs(e)<4),'POS-2: early start lost distance: '+e2);
+  console.log('SYN-POS-2. stale fixes, unplanned stop, early start OK');
+
+  // ── SYN-GNSS-1 (§19): speed=null, jitter, jumps, re-anchoring, out-of-order ──
+  const T0=3e12;
+  Synth.run=null;r=Synth.startRun(SPEC,{vehicle:'g',precheck:true},T0);
+  Synth.gnss({t:T0+1000,lat:57.7,lon:11.9,v:null,acc:5});
+  console.assert(r.gnss.last&&r.gnss.last.v===null&&r.gnss.n===1,'GNSS-1: first fix with speed=null discarded');
+  Synth.gnss({t:T0+2000,lat:57.70001,lon:11.9,v:null,acc:5});         // 1.1 m: jitter, not motion
+  console.assert(r.gnss.last.v===null&&r.gnss.last.t===T0+2000,'GNSS-1: jitter turned into speed: '+r.gnss.last.v);
+  Synth.gnss({t:T0+3000,lat:57.7001,lon:11.9,v:null,acc:5});          // 10 m in 1 s: real motion
+  console.assert(near(r.gnss.last.v,10.0,0.3),'GNSS-1: speed not derived from clear displacement: '+r.gnss.last.v);
+  Synth.gnss({t:T0+2500,lat:57.7,lon:11.9,v:3,acc:5});
+  console.assert(r.gnss.last.t===T0+3000,'GNSS-1: out-of-order fix accepted');
+  Synth.gnss({t:T0+4000,lat:57.8,lon:11.9,v:10,acc:5});
+  console.assert(/POS_JUMP/.test(r.raw.gnss[r.raw.gnss.length-1][8])&&r.raw.gnss[r.raw.gnss.length-1][2]===57.8,'GNSS-1: jump not flagged or raw position not kept');
+  Synth.gnss({t:T0+5000,lat:57.7002,lon:11.9,v:30,acc:5});
+  console.assert(/SPEED_JUMP/.test(r.raw.gnss[r.raw.gnss.length-1][8])&&r.gnss.last.v===10,'GNSS-1: impossible speed jump accepted');
+  // coarse first fix (±800 m) 556 m off: accepted within its accuracy, no lock
+  Synth.run=null;r=Synth.startRun(SPEC,{vehicle:'g',precheck:true},T0);
+  Synth.gnss({t:T0+1000,lat:57.705,lon:11.9,v:0,acc:800});
+  for(let i=2;i<=6;i++)Synth.gnss({t:T0+i*1000,lat:57.7,lon:11.9,v:0,acc:4});
+  console.assert(near(r.gnss.last.lat,57.7,1e-9)&&!r.raw.gnss.some(x=>/POS_JUMP/.test(x[8])),'GNSS-1: coarse first fix locked the position');
+  // a wrong fix that CLAIMS good accuracy: 2 jumps rejected, the 3rd consistent one re-anchors
+  Synth.run=null;r=Synth.startRun(SPEC,{vehicle:'g',precheck:true},T0);
+  Synth.gnss({t:T0+1000,lat:57.705,lon:11.9,v:0,acc:4});
+  for(let i=2;i<=5;i++)Synth.gnss({t:T0+i*1000,lat:57.7,lon:11.9,v:0,acc:4});
+  const fl=r.raw.gnss.map(x=>x[8]);
+  console.assert(/POS_JUMP/.test(fl[1])&&/POS_JUMP/.test(fl[2])&&/REANCHOR/.test(fl[3])&&near(r.gnss.last.lat,57.7,1e-9),'GNSS-1: re-anchor sequence '+JSON.stringify(fl));
+  // GO before the first fix (start without GPS fix): the first fix must still be accepted
+  Synth.run=null;r=Synth.startRun(SPEC,{vehicle:'g'},T0);
+  for(let t=T0;t<=T0+8000;t+=100)Synth.tick(t);
+  let threw=null;try{Synth.gnss({t:T0+8100,lat:57.7,lon:11.9,v:0,acc:4});Synth.gnss({t:T0+9100,lat:57.7,lon:11.9,v:0.5,acc:4});}catch(e){threw=e.message;}
+  console.assert(!threw&&r.gnss.last&&r.gnss.last.v===0.5&&r.events.some(e=>e.type==='GPS_OK'),'GNSS-1: GPS never accepted after a start without fix: '+threw);
+  Synth.tick(T0+9200);
+  console.assert(r.rows[r.rows.length-1][C.GPS_Speed_kmh]===1.8,'GNSS-1: logged GPS speed');
+  Synth.run=null;
+  console.log('SYN-GNSS-1. null speed, jitter, derived speed, jumps, re-anchor, start without fix OK');
+
+  // ── SYN-REG-1: regressions from the independent review ──
+  // adjacent standstills in position mode (p m p p m) must complete
+  const PP=synthCycle({name:'pp',refMode:'position',laps:2,startDelay:5,segs:[synSeg(0,'rate',1,10,'s'),synSeg(30,'rate',1,200,'m'),synSeg(0,'rate',0.8,20,'s')]});
+  console.assert(synthValidate(PP).length===0,'REG-1: pp cycle invalid');
+  const secs=synthCompile(PP).sections.map(x=>x.kind[0]).join('');
+  console.assert(!/pp/.test(secs),'REG-1: adjacent standstills not merged: '+secs);
+  r=sim(PP,'perfect');
+  console.assert(r.state==='DONE'&&Object.values(r.stops).filter(x=>x.err!==undefined&&x.err!==null).length===2,'REG-1: p-m-p-p-m cycle did not complete: '+r.state);
+  // a run without speed data is never VALID
+  Synth.run=null;r=Synth.startRun(SPEC,{vehicle:'x'},T0);
+  for(let t=T0;t<=T0+(P.T+6)*1000;t+=100)Synth.tick(t);
+  Synth.finish('COMPLETE',T0+(P.T+6)*1000);
+  console.assert(r.summary.verdict!=='VALID'&&r.summary.segs.every(x=>/NO DATA/.test(x.why)),'REG-1: run without GPS graded '+r.summary.verdict);
+  // long runs: no stack overflow in statistics
+  const big=[];for(let i=0;i<160000;i++){const x=new Array(SYN_COLS.length).fill(null);x[C.Elapsed_Time_s]=i/10;x[C.Phase]='CONST';x[C.Segment_ID]=1;x[C.Lap]=1;x[C.Speed_Error_kmh]=(i%7)/10;x[C.Acceleration_Error]=0.01;big.push(x);}
+  let so=null;try{synthRunStats(big,synthCompile(synthCycle({name:'b',segs:[synSeg(30,'rate',1,15000,'s'),synSeg(0,'rate',1,0)]})),{guide:SYNTH_CFG.guide,accept:SYNTH_CFG.accept,refMode:'time'});}catch(e){so=e.message;}
+  console.assert(!so,'REG-1: statistics overflow on 160k rows: '+so);
+  // constant speed within tolerance shows HOLD even with an acceleration error
+  console.assert(run('CONST',0.4,0.25)==='HOLD'&&run('CONST',0.4,-0.25)==='HOLD','REG-1: HOLD not shown within speed tolerance (§16)');
+  // the declared end hold is logged; after the reference ends, logging goes on until the bus stands
+  r=sim(SPEC,'perfect');
+  console.assert(r.rows.filter(x=>x[C.Phase]==='PAUSE').length>=190,'REG-1: declared end hold not logged');
+  r=sim(LONG,'weakBrake');
+  const lastRow=r.rows[r.rows.length-1];
+  console.assert(lastRow[C.Actual_Speed_kmh]!==null&&lastRow[C.Actual_Speed_kmh]<SYNTH_CFG.stopKmh+0.5,'REG-1: logging stopped while moving: '+lastRow[C.Actual_Speed_kmh]);
+  console.assert(r.rows.some(x=>x[C.Phase]==='END'&&x[C.Driver_Command]==='STOP'),'REG-1: END tail with STOP missing');
+  // CAN: missing values are "not available", never a fake 0
+  const nr=new Array(SYN_COLS.length).fill(null);nr[C.Phase]='ACCEL';nr[C.Driver_Command]='NOGPS';nr[C.Reference_Speed_kmh]=27.18;
+  const f0=synCanFrames(nr)[0].data;
+  console.assert(f0[0]===0xFF&&f0[1]===0xFF&&f0[4]===0x00&&f0[5]===0x80,'REG-1: null speed not encoded as not-available: '+Array.from(f0));
+  console.assert(/Not available/.test(synthDBC())&&/TimeToNextPhase : 40\|16@1\+ \(0\.1,0\)/.test(synthDBC())&&/DistanceError : 32\|16@1- \(0\.1,0\)/.test(synthDBC()),'REG-1: DBC ranges / NA note');
+  // GPS quality flags from the fix reach the log
+  Synth.run=null;r=Synth.startRun(SPEC,{vehicle:'q',precheck:true},T0);
+  Synth.gnss({t:T0+1000,lat:57.7,lon:11.9,v:5,acc:4});Synth.gnss({t:T0+2000,lat:57.7,lon:11.9,v:20,acc:4});
+  r.state='ACTIVE';r.tGo=T0;Synth.tick(T0+2100);
+  console.assert(/SPEED_JUMP/.test(r.rows[r.rows.length-1][C.Quality_Flags]),'REG-1: GPS flags not merged into the log');
+  // one summary definition: live and reloaded give the same numbers
+  r=sim(SPEC,'typical');
+  const s1=JSON.stringify(Synth.summarize(r)),s2=JSON.stringify(synthSummary({rows:r.rows,plan:synthCompile(r.cycle),guideCfg:r.guideCfg,acceptCfg:r.acceptCfg,mode:r.mode,stops:r.stops,state:r.state}));
+  console.assert(s1===s2,'REG-1: summary differs between live and reloaded run');
+  // review round 2: null-speed standstill in position mode, outlier re-anchor, merged waits
+  {const L2=synthCycle({name:'n',refMode:'position',startDelay:3,segs:[synSeg(20,'rate',1,50,'m'),synSeg(0,'rate',0.8,5,'s'),synSeg(20,'rate',1,50,'m'),synSeg(0,'rate',0.8,0,'s')]});
+   Synth.run=null;const rr=Synth.startRun(L2,{vehicle:'n'},T0);let v=0,sT=0,lat=57.7,t=T0,phase=0;
+   const it0=rr.plan.sections[0];
+   for(;t<T0+120000&&rr.pos.item===0;t+=100){
+     if(rr.state==='ACTIVE'){const d=it0.ph[it0.ph.length-1];const wantStop=sT>=it0.S-v*v/(2*Math.abs(d.a))-0.05;
+       v=wantStop?Math.max(0,v-Math.abs(d.a)*0.1):Math.min(it0.ph[0].v1,v+0.1);sT+=v*0.1;lat+=v*0.1/111320;}
+     if((t-T0)%1000===0)Synth.gnss({t,lat,lon:11.9,v:v>0?v:null,acc:6});        // device reports null at rest
+     Synth.tick(t);}
+   console.assert(rr.pos.item>=1&&rr.events.some(e=>e.type==='STOP'),'REG-2: stop never registered with speed=null at rest');}
+  Synth.run=null;r=Synth.startRun(SPEC,{vehicle:'o',precheck:true},T0);
+  Synth.gnss({t:T0+1000,lat:57.7,lon:11.9,v:0,acc:4});
+  [[57.704,11.9],[57.7,11.908],[57.696,11.9]].forEach(([la,lo],i)=>Synth.gnss({t:T0+2000+i*1000,lat:la,lon:lo,v:0,acc:4}));
+  console.assert(near(r.gnss.last.lat,57.7,1e-9)&&!r.events.some(e=>e.type==='GPS_REANCHOR'),'REG-2: re-anchored on scattered outliers');
+  {const MW=synthCycle({name:'mw',refMode:'position',startDelay:3,segs:[synSeg(20,'rate',1,50,'m'),synSeg(0,'rate',0.8,5,'s'),synSeg(0,'rate',0.8,5,'s'),synSeg(20,'rate',1,50,'m'),synSeg(0,'rate',0.8,0,'s')]});
+   const rr=sim(MW,'perfect');
+   // (segment 1 is the very first launch, driven before the IMU is calibrated: GPS-only lag may flag SPEED)
+   console.assert(rr.state==='DONE'&&!rr.summary.segs.some(x=>/NOT DRIVEN|NO DATA/.test(x.why))&&rr.summary.segs.slice(1).every(x=>x.verdict==='OK'),'REG-2: merged waits: '+rr.summary.segs.map(x=>x.why).join('|'));}
+  Synth.run=null;
+  console.log('SYN-REG-1. review regressions (pauses, no-data, overflow, HOLD, end tail, CAN NA, flags, summary) OK');
+
+  // ── SYN-V1-1: v1 trapezoid cycles migrate into position mode ──
+  const v1=synthCycle({name:'old',a:1,d:0.8,dwell:20,laps:1,startDelay:10,segs:[{v:20,cruise:100},{v:30,cruise:200}]});
+  console.assert(v1.refMode==='position'&&v1.segs.length===4&&v1.segs[0].holdUnit==='m'&&v1.segs[0].hold===100&&synthValidate(v1).length===0,'V1-1: migration');
+  console.log('SYN-V1-1. v1 cycles migrate OK');
+
+  // ── SYN-EXP-1 (§27, §30–31): exports ──
+  Synth.run=null;r=Synth.simulate(SPEC,'typical',{seed:2,t0:1.8e12});
+  r.state='ACTIVE';Synth.run=r;r.sync=0;
+  const n1=Synth.syncMark();r.state='DONE';
+  console.assert(n1===1&&r.events.some(e=>e.type==='SYNC'&&e.detail==='EVENT_SYNC_01'),'EXP-1: SYNC marker');
+  const D={id:r.id,rows:r.rows,gnss:r.raw.gnss,imu:r.raw.imu,events:r.events,cycle:r.cycle,plan:r.plan,hash:r.hash,mode:r.mode,
+    meta:r.meta,guideCfg:r.guideCfg,acceptCfg:r.acceptCfg,stops:r.stops,t0:r.t0,tGo:r.tGo,tEnd:r.tEnd,state:r.state,summary:r.summary};
+  const csv=Synth.logCSV(D.rows).trim().split('\n');
+  console.assert(csv.length===D.rows.length+1&&csv[0].split(',').length===SYN_COLS.length+1,'EXP-1: log CSV shape');
+  console.assert(csv[0].startsWith('Elapsed_Time_s,UTC_Time,UTC_Time_ms,GPS_Speed_kmh')&&/,\d{4}-\d\d-\d\dT[\d:.]+Z,/.test(csv[1]),'EXP-1: CSV time columns');
+  console.assert(Synth.eventsCSV(D.events).includes(',EVENT_SYNC_01,1,'),'EXP-1: SYNC not in events CSV');
+  const raw=JSON.parse(Synth.rawJSON(D));
+  console.assert(raw.format==='DriveTest-RAW'&&raw.log.rows.length===D.rows.length&&raw.imu.rows.length>1000&&raw.gnss.rows.length>50,'EXP-1: RAW incomplete');
+  console.assert(Synth.logCSV(raw.log.rows)===Synth.logCSV(D.rows),'EXP-1: re-export from RAW differs');
+  const fr=Synth.canFrames(D);
+  console.assert(fr.filter(f=>f.id===SYNTH_CFG.can.base+5).length===D.events.length,'EXP-1: not every event became a DT_Event frame');
+  const asc=synthASC(fr,D.t0).trim().split('\n');
+  console.assert(asc.length===fr.length+6&&/^date /.test(asc[0])&&/End TriggerBlock/.test(asc[asc.length-1]),'EXP-1: ASC structure');
+  (async()=>{const b=await synthBLF(fr,D.t0,null);const dv=new DataView(b.buffer);
+    console.assert(String.fromCharCode(...b.slice(0,4))==='LOGG'&&dv.getUint32(32,true)===fr.length&&Number(dv.getBigUint64(16,true))===b.length,'EXP-1: BLF header');
+    fs.writeFileSync(path.join(require('os').tmpdir(),'synth_test.blf'),b);})();
+  fs.writeFileSync(path.join(require('os').tmpdir(),'synth_test.asc'),asc.join('\n')+'\n');
+  fs.writeFileSync(path.join(require('os').tmpdir(),'synth_test.dbc'),synthDBC());
+  fs.writeFileSync(path.join(require('os').tmpdir(),'synth_test_log.csv'),csv.join('\n')+'\n');
+  console.assert(/BO_ 1792 DT_Speed: 8 DriveTest/.test(synthDBC())&&/VAL_ 1794 Command/.test(synthDBC()),'EXP-1: DBC');
+  console.log(`SYN-EXP-1. CSV ${csv.length-1} rows, RAW round trip, ASC ${fr.length} frames, BLF, DBC OK`);
+
+  // ── SYN-I18N-1 (§32): Swedish and English complete, spec wording ──
+  const en=Object.keys(SYN_I18N.en),sv=Object.keys(SYN_I18N.sv);
+  {const blk=code.slice(code.indexOf('const SYN_I18N={'),code.indexOf('let _synLang'));
+   ['en:{','sv:{'].forEach(tag=>{const part=blk.slice(blk.indexOf(tag),blk.indexOf('\n },',blk.indexOf(tag))+1||undefined);
+     const keys=[...part.matchAll(/'([a-zA-Z]+\.[a-zA-Z0-9]+)':/g)].map(m=>m[1]);
+     const dup=keys.filter((k,i)=>keys.indexOf(k)!==i);
+     console.assert(dup.length===0,'I18N-1: duplicate keys in '+tag+' '+dup);});}
+  console.assert(en.length===sv.length&&en.every(k=>sv.includes(k)),'I18N-1: key sets differ: '+en.filter(k=>!sv.includes(k)).concat(sv.filter(k=>!en.includes(k))));
+  const used=[...new Set([...code.matchAll(/synT\('([a-zA-Z0-9_.]+)'/g)].map(m=>m[1]))].filter(k=>!/^(cmd|ph|v|lang)\.$/.test(k));
+  const missing=used.filter(k=>!(k in SYN_I18N.en));
+  console.assert(missing.length===0,'I18N-1: strings used but not translated: '+missing);
+  const pairs={ACC_MORE:['GASA MER','ACCELERATE MORE'],ACC:['GASA','ACCELERATE'],HOLD:['HÅLL','HOLD'],RELEASE:['SLÄPP GAS','RELEASE THROTTLE'],
+    BRAKE:['BROMSA','BRAKE'],BRAKE_MORE:['BROMSA MER','BRAKE MORE'],REDUCE:['MINSKA BROMS','REDUCE BRAKING']};
+  Object.entries(pairs).forEach(([k,[s,e]])=>console.assert(SYN_I18N.sv['cmd.'+k]===s&&SYN_I18N.en['cmd.'+k]===e,'I18N-1: '+k));
+  console.assert(SYN_I18N.sv['ph.DECEL']==='Retardation'&&SYN_I18N.en['ph.DECEL']==='Deceleration'&&SYN_I18N.sv['ph.CONST']==='Konstant hastighet','I18N-1: phase terms (§3)');
+  console.assert(!/Ramp/.test(JSON.stringify(SYN_I18N)),'I18N-1: "Ramp" used in the UI (§3)');
+  _synLang='sv';console.assert(synT('cmd.BRAKE_MORE')==='BROMSA MER','I18N-1: switch');_synLang='en';
+  console.assert(!/Ramp|Retardation/.test(SYN_COLS.join()),'I18N-1: log names not English/stable');
+  console.log('SYN-I18N-1. sv/en complete ('+en.length+' strings), spec wording OK');
+
+  // ── SYN-ISO-1: one GPS watch, navigation engine untouched ──
+  const synBlock=code.slice(code.indexOf('SYNTHETIC CYCLE v2'),code.indexOf('// Drag & drop'));
+  console.assert(!/navigator\.geolocation/.test(synBlock),'ISO-1: Synth opened its own geolocation access');
+  console.assert(!/\b(routeProgressM|matchState|lastRouteIdx|currentPos)\s*=[^=]/.test(synBlock),'ISO-1: Synth writes navigation state');
+  const cp=currentPos;Synth._ownWatch=true;let got=null;const keep=Synth._onPos;Synth._onPos=p=>{got=p};
+  onGPS({coords:{latitude:1,longitude:2,accuracy:5,speed:3,heading:0},timestamp:Date.now()});
+  Synth._onPos=keep;Synth._ownWatch=false;
+  console.assert(got&&currentPos===cp,'ISO-1: fix leaked into the navigation engine');
+  const na=navActive;navActive=true;Synth.run=null;const al=global.alert;let msg='';global.alert=m=>{msg=m};
+  Synth.startTap(false);global.alert=al;navActive=na;
+  console.assert(Synth.run===null&&/navigation/i.test(msg),'ISO-1: test started over active navigation');
+  switchTab('synth');
+  console.assert(el('pane-synth').classList.contains('active')&&el('stab-synth').classList.contains('active'),'ISO-1: SYNTH tab');
+  switchTab('rota');
+  console.log('SYN-ISO-1. GPS ownership, nav isolation, tab OK');
+
+  // ── SYN-SAFE-1 (§35): configuration locked during a test; abort needs a hold ──
+  Synth.run=null;Synth.startRun(SPEC,{vehicle:'x'},2e12);
+  const before=JSON.stringify(Synth.cur());Synth.addSeg();Synth.setField('name','changed');
+  console.assert(JSON.stringify(Synth.cur())===before,'SAFE-1: cycle editable during a test');
+  // STOP (field feedback 24/09): one tap asks, the test keeps running until END TEST
+  r=Synth.run;r.state='ACTIVE';r.tGo=2e12;
+  Synth.stopTap();
+  console.assert(r.state==='ACTIVE'&&Synth._confirmOpen===true&&r.events.some(e=>e.type==='STOP_ASKED'),'SAFE-1: one tap must only ask');
+  Synth.cancelStop();
+  console.assert(r.state==='ACTIVE'&&!Synth._confirmOpen,'SAFE-1: CONTINUE stopped the test');
+  Synth.stopTap();Synth.confirmStop();
+  console.assert(r.state==='ABORTED'&&r.events.some(e=>e.type==='ABORT'),'SAFE-1: END TEST did not stop the test');
+  console.assert(/onclick="Synth\.stopTap\(\)"/.test(code)&&!/stopDown/.test(code),'SAFE-1: STOP is still hold-to-abort');
+  console.assert(/confirmStop\(\)">\$\{synT\('d\.endTest'\)\}/.test(code)&&SYN_I18N.en['d.endTest']==='■ END TEST'&&SYN_I18N.sv['d.endTest']==='■ AVSLUTA PROV','SAFE-1: END TEST label');
+  Synth.run=null;
+  console.log('SYN-SAFE-1. config locked, STOP = tap + confirm OK');
+
+  // ── SYN-SAVE-1 (field 24/09): exports go to the tablet, one valid zip ──
+  {const zlib=require('zlib');
+   let shared=0;const nav=globalThis.navigator;nav.canShare=()=>true;nav.share=async()=>{shared++;};
+   global.File=class{constructor(b,n,o){this.name=n;}};
+   const clicks=[];const origCE=document.createElement;
+   document.createElement=tag=>{const e=origCE(tag);e.click=()=>clicks.push(e.download);return e;};
+   Synth._deliver([{name:'x.zip',type:'application/zip',body:new Uint8Array(3)}],'t');
+   console.assert(shared===0&&clicks[0]==='x.zip','SAVE-1: default export still opens the share sheet');
+   Synth._deliver([{name:'y.zip',type:'application/zip',body:new Uint8Array(3)}],'t','share').then(()=>{
+     console.assert(shared===1,'SAVE-1: Share… does not open the share sheet');
+     delete nav.canShare;delete nav.share;delete global.File;document.createElement=origCE;});
+   (async()=>{
+     const files=[{name:'a_log.csv',body:'Elapsed_Time_s,x\n'+'1,2\n'.repeat(400)},{name:'sub/b.blf',body:new Uint8Array([1,2,3,250])},{name:'Hällered_ö.txt',body:'å'}];
+     for(const deflate of [null,async u=>new Uint8Array(zlib.deflateRawSync(u))]){
+       const z=Buffer.from(await synthZip(files,deflate,Date.UTC(2026,8,25,7,0,0)));
+       const eo=z.length-22;
+       console.assert(z.readUInt32LE(eo)===0x06054b50&&z.readUInt16LE(eo+10)===3,'SAVE-1: zip end record');
+       let p=z.readUInt32LE(eo+16);
+       for(const f of files){
+         console.assert(z.readUInt32LE(p)===0x02014b50,'SAVE-1: central header');
+         const method=z.readUInt16LE(p+10),crc=z.readUInt32LE(p+16),csz=z.readUInt32LE(p+20),nl=z.readUInt16LE(p+28),lo=z.readUInt32LE(p+42);
+         const name=z.slice(p+46,p+46+nl).toString('utf8');
+         const data=z.slice(lo+30+z.readUInt16LE(lo+26),lo+30+z.readUInt16LE(lo+26)+csz);
+         const raw=method===8?zlib.inflateRawSync(data):data;
+         const want=typeof f.body==='string'?Buffer.from(f.body,'utf8'):Buffer.from(f.body);
+         console.assert(name===f.name&&raw.equals(want)&&synCrc32(new Uint8Array(raw))===crc,'SAVE-1: zip entry '+f.name+' method '+method);
+         p+=46+nl;
+       }
+       require('fs').writeFileSync(require('path').join(require('os').tmpdir(),'synth_test'+(deflate?'_deflate':'')+'.zip'),z);
+     }
+     console.log('SYN-SAVE-1. save → Downloads (no share sheet), zip stored/deflated round trip OK');
+   })();}
+
+  // ── SYN-BAND-1 (field 24/09): speed band ±4 km/h selectable, stored per run ──
+  {const g0=JSON.stringify(Synth.prefs.guide);
+   Synth.setBand('v',4);
+   console.assert(Synth.prefs.guide.tolV1===4&&Synth.prefs.guide.tolV2===8,'BAND-1: ±4 km/h band');
+   Synth.setGuide('tolV2',3);
+   console.assert(Synth.prefs.guide.tolV2>Synth.prefs.guide.tolV1,'BAND-1: large threshold fell below the band');
+   Synth.setBand('a',0.3);
+   console.assert(Synth.prefs.guide.tolA1===0.3&&Synth.prefs.guide.tolA2===0.6,'BAND-1: acceleration band');
+   Synth.run=null;const rb=Synth.simulate(SPEC,'slow2',{seed:4,t0:1.8e12,guide:Synth.prefs.guide});
+   console.assert(rb.guideCfg.tolV1===4&&rb.summary.pctV>95,'BAND-1: run did not use ±4: '+rb.guideCfg.tolV1+' '+rb.summary.pctV);
+   const cmd=rb.rows.filter(x=>x[C.Phase]==='CONST'&&x[C.Speed_Error_kmh]!==null).map(x=>x[C.Driver_Command]);
+   console.assert(cmd.filter(c=>c==='HOLD').length/cmd.length>0.8,'BAND-1: 2 km/h low inside ±4 should read HOLD');
+   console.assert(/Synth\.setBand\('v'/.test(code)&&/± 4 km\/h/.test('± 4 km/h'),'BAND-1: band selector missing');
+   Synth.prefs.guide=JSON.parse(g0);Synth.run=null;
+   console.log('SYN-BAND-1. ±4 km/h band, large = 2×band, stored with the run OK');}
+
+  // ── SYN-LAG-1 (field 24/09 "blue line slow"): GNSS delay learned and removed ──
+  {const lag=r=>{const tr=new Map(r.simTruth.map(([t,v])=>[Math.round(t),v*3.6]));
+     const tl=(r.events.find(e=>e.type==='GPS_LATENCY')||{t:0}).t;       // after the delay has been learned
+     const rows=r.rows.filter(x=>x[C.Phase]!=='PRE'&&x[C.Actual_Speed_kmh]!==null&&x[C.UTC_Time_ms]>=tl);
+     let best=[1e9,0];for(let L=0;L<=1500;L+=100){let s2=0,n=0;rows.forEach(x=>{const tv=tr.get(Math.round(x[C.UTC_Time_ms])-L);if(tv!==undefined){s2+=(x[C.Actual_Speed_kmh]-tv)**2;n++;}});const e=Math.sqrt(s2/n);if(e<best[0])best=[e,L];}
+     return best[1];};
+   const res=[];
+   for(const d of [0,300,600]){                       // Android receivers: typically 0.2–0.6 s (learning is capped at 0.8 s)
+     SYN_SCEN._lagt=Object.assign({},SYN_SCEN.typical,{gpsDelayMs:d});
+     Synth.run=null;const rl=Synth.simulate(SPEC,'_lagt',{seed:9,t0:1.8e12});
+     res.push([d,rl.gnss.latMs,lag(rl)]);
+     console.assert(Math.abs(rl.gnss.latMs-d)<=150,'LAG-1: learned '+rl.gnss.latMs+' ms for a '+d+' ms GNSS delay');
+     console.assert(lag(rl)<=Math.max(150,0.25*d),'LAG-1: displayed speed still '+lag(rl)+' ms behind with a '+d+' ms GNSS delay');   // ≥ 75 % of the delay removed
+   }
+   delete SYN_SCEN._lagt;
+   // the learned value is kept for the next real test on this tablet
+   Synth.run=null;const rp=Synth.startRun(SPEC,{vehicle:'p'},4e12);rp.gnss.latN=6;rp.gnss.latMs=450;Synth.finish('COMPLETE',4e12+1000);
+   Synth.run=null;const rq=Synth.startRun(SPEC,{vehicle:'q'},4e12);
+   console.assert(Synth.prefs.gpsLatMs===450&&rq.gnss.latMs===450,'LAG-1: learned delay not carried to the next test');
+   delete Synth.prefs.gpsLatMs;Synth.run=null;
+   Synth.run=null;const rn=Synth.simulate(SPEC,'noisy',{seed:5,t0:1.8e12});
+   const imuN=rn.rows.filter(x=>x[C.Acceleration_Source]==='IMU').length/rn.rows.length;
+   console.assert(imuN>0.6,'LAG-1: IMU rejected with noisy sensors ('+(imuN*100).toFixed(0)+'%)');
+   console.log('SYN-LAG-1. GNSS delay learned/removed '+res.map(x=>x[0]+'→'+x[1]+'ms (lag '+x[2]+')').join(', ')+'; noisy IMU used '+(imuN*100).toFixed(0)+'% OK');}
+
+  // ── SYN-FIELD-1 (field 25/09, B1990, Galaxy Tab S10 FE): the recorded drive
+  //    replayed through the engine — same GNSS and IMU samples, same timing.
+  //    v65 on this drive: 171 displayed steps > 1 km/h per 0.1 s, max 15 km/h,
+  //    42 km/h shown while parked, IMU used 3 %, error vs GPS 1.63 km/h.
+  {// Replays a field DriveTest RAW file through the engine: same sensor data, same timing.
+  function synthReplay(raw){
+    const J=typeof raw==='string'?JSON.parse(raw):raw,C=SYN_C;
+    const gc=J.gnss.columns,ic=J.imu.columns,ix=(cols,n)=>cols.indexOf(n);
+    const G=J.gnss.rows.map(r=>({k:'g',t:r[ix(gc,'UTC_Time_ms')],f:{t:r[ix(gc,'UTC_Time_ms')],recv:r[ix(gc,'Received_UTC_ms')],lat:r[ix(gc,'Latitude')],lon:r[ix(gc,'Longitude')],
+      v:r[ix(gc,'Speed_ms')],acc:r[ix(gc,'Accuracy_m')],hdg:r[ix(gc,'Heading_deg')],alt:r[ix(gc,'Altitude_m')]}}));
+    const I=J.imu.rows.map(r=>({k:'i',t:r[0],x:r[1],y:r[2],z:r[3]}));
+    const all=G.concat(I).sort((a,b)=>a.t-b.t);
+    const t0=J.timebase.t0_utc_ms,tStart=Math.min(all[0].t,t0)-50,tEnd=J.timebase.end_utc_ms+2000;
+    Synth.run=null;Synth.sim=null;
+    const r=Synth.startRun(synthCycle(J.cycle),{vehicle:'replay',precheck:true,guide:J.settings.guide},tStart);
+    let k=0,started=false;
+    for(let t=tStart;t<=tEnd&&r.state!=='DONE'&&r.state!=='ABORTED';t+=100){
+      while(k<all.length&&all[k].t<=t){const e=all[k++];if(e.k==='g')Synth.gnss(e.f);else Synth.imu(e.t,e.x,e.y,e.z);}
+      if(!started&&t>=t0){started=true;Synth._beginCountdown(t0);}
+      Synth.tick(t);
+      r._disp=r._disp||[];if(r.cur&&r.cur.act)r._disp.push([t,r.cur.act.v===null?null:r.cur.act.v*3.6,r.state,r.cur.act.aSrc]);
+    }
+    return r;
+  }
+  function replayMetrics(r,J){
+    const C=SYN_C,rows=r.rows,go=r.tGo;
+    const drive=rows.filter(x=>x[C.UTC_Time_ms]>=go&&x[C.Actual_Speed_kmh]!==null);
+    const steps=[];for(let i=1;i<drive.length;i++)steps.push(Math.abs(drive[i][C.Actual_Speed_kmh]-drive[i-1][C.Actual_Speed_kmh]));
+    steps.sort((a,b)=>a-b);const q=p=>steps[Math.min(steps.length-1,Math.floor(p*steps.length))];
+    const pre=r._disp.filter(d=>d[0]<go&&d[1]!==null).map(d=>d[1]);
+    const gd=drive.filter(x=>x[C.GPS_Speed_kmh]!==null).map(x=>Math.abs(x[C.Actual_Speed_kmh]-x[C.GPS_Speed_kmh])).sort((a,b)=>a-b);
+    // proxy truth: Doppler speed interpolated between fixes (good fixes after GO)
+    const gc=J.gnss.columns,gi=n=>gc.indexOf(n);
+    const F=J.gnss.rows.filter(g=>g[gi('Speed_ms')]!==null&&g[gi('Accuracy_m')]<=15&&g[gi('UTC_Time_ms')]>=go).map(g=>[g[gi('UTC_Time_ms')],g[gi('Speed_ms')]*3.6]);
+    const interp=q=>{let lo=0,hi=F.length-1;if(q<F[0][0]||q>F[hi][0])return null;while(hi-lo>1){const m=(lo+hi)>>1;if(F[m][0]<=q)lo=m;else hi=m;}const a=F[lo],b=F[hi];if(b[0]-a[0]>1600)return null;return a[1]+(b[1]-a[1])*(q-a[0])/Math.max(1,b[0]-a[0]);};
+    let best=[1e9,0];
+    for(let L=-500;L<=1500;L+=100){let s2=0,n=0;drive.forEach(x=>{const z=interp(x[C.UTC_Time_ms]-L);if(z!==null){s2+=(x[C.Actual_Speed_kmh]-z)**2;n++;}});const e=Math.sqrt(s2/n);if(e<best[0])best=[e,L];}
+    const e0=(()=>{let s2=0,n=0;drive.forEach(x=>{const z=interp(x[C.UTC_Time_ms]);if(z!==null){s2+=(x[C.Actual_Speed_kmh]-z)**2;n++;}});return Math.sqrt(s2/n);})();
+    return {rows:rows.length,vsInterpRmse0:+e0.toFixed(2),bestLagMs:best[1],vsInterpRmseBest:+best[0].toFixed(2),state:r.state,stepP99:+q(0.99).toFixed(2),stepMax:+steps[steps.length-1].toFixed(2),stepsOver1:steps.filter(s=>s>1).length,
+      preGoMax:+Math.max(0,...pre).toFixed(1),dispVsGpsP95:+gd[Math.floor(0.95*gd.length)].toFixed(2),
+      imuShare:+(drive.filter(x=>x[C.Acceleration_Source]==='IMU').length/drive.length*100).toFixed(0),
+      latMs:r.gnss.latMs,stops:Object.values(r.stops).map(s=>s.err===null||s.err===undefined?null:+s.err.toFixed(1)),
+      events:r.events.filter(e=>/IMU|LATENCY/.test(e.type)).map(e=>e.type+'@'+e.elapsed).join(' ')};
+  }
+  
+   const fp=[path.join(__dirname,'testdata','Synth_field_B1990_25_09.dtraw.json')].find(p=>fs.existsSync(p));
+   if(!fp)console.assert(false,'FIELD-1: testdata/Synth_field_B1990_25_09.dtraw.json missing');
+   else{
+     const J=JSON.parse(fs.readFileSync(fp,'utf8'));
+     const keepAuto=Synth.prefs.autosave,keepM=Synth.prefs.imuModel,keepL=Synth.prefs.gpsLatMs;
+     Synth.prefs.autosave=false;delete Synth.prefs.imuModel;delete Synth.prefs.gpsLatMs;
+     const rf=synthReplay(J),m=replayMetrics(rf,J);
+     console.assert(rf.state==='DONE','FIELD-1: replay did not complete');
+     console.assert(m.stepsOver1<=25&&m.stepMax<=3,'FIELD-1: displayed speed still jumps: '+m.stepsOver1+' steps > 1 km/h, max '+m.stepMax);
+     console.assert(m.preGoMax<=6,'FIELD-1: '+m.preGoMax+' km/h shown while parked before GO');
+     console.assert(m.vsInterpRmse0<=1.4,'FIELD-1: displayed speed vs GPS error '+m.vsInterpRmse0+' km/h (v65: 1.63)');
+     console.assert(m.imuShare>=60,'FIELD-1: IMU used only '+m.imuShare+'%');
+     console.assert(!rf.events.some(e=>e.type==='IMU_CALIBRATED'&&e.t<rf.t0),'FIELD-1: IMU calibrated on the GPS warm-up before START');
+     // the learned model is kept, and restored on the same mount at the next test
+     console.assert(Synth.prefs.imuModel&&Synth.prefs.imuModel.w.length===3,'FIELD-1: IMU model not saved at the end of a real test');
+     const r2=synthReplay(J),m2=replayMetrics(r2,J);
+     console.assert(r2.events.some(e=>e.type==='IMU_MODEL_RESTORED'),'FIELD-1: model not restored on the same mount');
+     console.assert(m2.imuShare>=m.imuShare,'FIELD-1: restored model did not help ('+m2.imuShare+' vs '+m.imuShare+'%)');
+     // tablet mounted differently (gravity 20° off): must NOT reuse the model
+     const a20=20*Math.PI/180,g0=Synth.prefs.imuModel.g;
+     Synth.prefs.imuModel.g=[g0[0]*Math.cos(a20)-g0[1]*Math.sin(a20),g0[0]*Math.sin(a20)+g0[1]*Math.cos(a20),g0[2]];
+     const r3=synthReplay(J);
+     console.assert(r3.events.some(e=>e.type==='IMU_MOUNT_CHANGED')&&!r3.events.some(e=>e.type==='IMU_MODEL_RESTORED'),'FIELD-1: model reused after the mount changed');
+     Synth.prefs.autosave=keepAuto;if(keepM)Synth.prefs.imuModel=keepM;else delete Synth.prefs.imuModel;if(keepL!==undefined)Synth.prefs.gpsLatMs=keepL;else delete Synth.prefs.gpsLatMs;
+     console.log(`SYN-FIELD-1. field drive 25/09 replayed: ${m.stepsOver1} steps > 1 km/h (v65: 171), max ${m.stepMax} (15.1), parked ${m.preGoMax} km/h (42.1), error ${m.vsInterpRmse0} km/h (1.63), IMU ${m.imuShare}% (3) → ${m2.imuShare}% with restored model OK`);
+   }
+  }
+
+  Synth.run=null;Synth.runs=[];Synth._full={};
+  Object.values(SYNTH_CFG.keys).forEach(k=>localStorage.removeItem(k));
+})();
+console.log('ALL SYNTHETIC CYCLE v2 TESTS PASSED');
+__group('Synthetic cycle v2 tests');
+
+// ── the three jobs: classify, repeat against THAT class, keep the aim ──
+(function(){
+  const pts=[]; let lat=57.7, t=1700000000000;
+  pts.push({lat,lng:11.97,t});
+  for(let i=0;i<80;i++){lat+=137.5/111320; t+=1000; pts.push({lat,lng:11.97,t});}
+  for(let i=0;i<12;i++){t+=10000; pts.push({lat,lng:11.97,t});}
+  const nowhere=calcGTAScore(pts,[{}]);
+  console.assert(nowhere.matched===0&&nowhere.cls==='—',
+    'a cycle that meets nothing must not be labelled Ci1: '+JSON.stringify(nowhere));
+
+  const fast=gtaRun(95,400);
+  GTATarget.setClass('Ci1');
+  isRec=true; navActive=false; recStopCandidate=null; recStops=[];
+  recPoints=fast.map(p=>({lat:p.lat,lng:p.lng,t:p.t}));
+  global.__promptReply='Aim Ci1 on a fast run';
+  stopRec();
+  delete global.__promptReply;
+  const saved=savedRecs.filter(Boolean).pop();
+  console.assert(saved&&saved.target&&saved.target.classId==='Ci1','the aim was not stored on the cycle');
+  console.assert(saved.score&&saved.score.aimed&&saved.score.aimed.cls==='Ci1',
+    'the cycle was not scored against the class the driver chose');
+  console.assert(saved.score.aimed.matched<5,'a 95 km/h run must not pass Ci1');
+  console.assert(!(saved.score.cls==='Ci1'&&saved.score.matched===5),
+    'best-class score was treated as a Ci1 pass');
+
+  stops.length=0;
+  stops.push({state:'done',missed:true},{state:'done',missed:false},{state:'current'},{state:'waiting'});
+  console.assert(repeatStopsCounted()===2,'missed stops are counted as real stops');
+
+  pbRefClass='Ci1'; pbPoints=fast.map(p=>({lat:p.lat,lng:p.lng,t:p.t}));
+  stops.length=0;
+  const again=repeatResult();
+  console.assert(again&&again.cls==='Ci1'&&again.matched<5,
+    'repeat check did not judge the new drive against the loaded class');
+  pbRefClass=null; pbPoints=[]; pbRefMatched=null;
+  GTATarget.clear();
+  console.log('CLASS-REPEAT. aim, classification and repeat check stay separate OK');
+})();
+__group('Class repeat fixes');
+

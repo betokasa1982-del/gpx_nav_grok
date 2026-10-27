@@ -72,7 +72,8 @@ body{font-family:var(--sans);background:var(--bg);color:var(--text);display:flex
 .topbar{display:flex;align-items:center;gap:6px;padding:calc(7px + var(--safe-t)) 10px 7px;
   background:var(--panel);border-bottom:1px solid var(--border);z-index:3000;flex-shrink:0;min-height:52px}
 .logo{font-size:16px;font-weight:700;letter-spacing:2px;color:var(--accent);display:flex;align-items:center;gap:4px;flex-shrink:0}
-.top-stats{display:flex;gap:8px;flex:1;overflow:hidden;align-items:center}
+.logo-mark{font-size:12px;background:#ffc400;color:#000000;padding:1px 5px;border-radius:8px;font-weight:800;letter-spacing:.4px}
+.top-stats{display:flex;gap:8px;flex:1;min-width:0;overflow:hidden;align-items:center}
 .tstat{display:flex;flex-direction:column;min-width:0}
 .tstat-l{font-size:12px;letter-spacing:1px;text-transform:uppercase;color:var(--muted);font-family:var(--mono)}
 .tstat-v{font-size:14px;font-weight:700;font-family:var(--mono);white-space:nowrap}
@@ -1174,8 +1175,10 @@ body.cockpit #hud-voice{position:absolute!important;right:14px!important;
 /* Fixed action bar — carries START. It cannot be dragged. */
 .actionbar{position:fixed;left:0;right:0;bottom:0;height:calc(var(--ab-h) + var(--safe-b));
   padding:0 var(--s-md) var(--safe-b);z-index:1300;background:var(--panel);
-  border-top:1px solid var(--border);display:flex;align-items:center;gap:var(--s-md)}
+  border-top:1px solid var(--border);display:flex;align-items:center;gap:var(--s-md);
+  overflow:hidden}
 .ab-icon{font-size:24px;flex-shrink:0}
+.peek-sub{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 
 /* The old sheet chrome is gone — neutralise anything still keyed to it. */
 .sheet-handle,.sheet-tabs,.stab{display:none!important}
@@ -1184,6 +1187,11 @@ body.cockpit #hud-voice{position:absolute!important;right:14px!important;
   :root{--rail-w:80px}
   .drawer{width:calc(100vw - var(--rail-w))}
   .rail-lbl{font-size:13px}
+  .tstat-opt,.tdiv-opt{display:none}
+  .peek-sub{display:none}
+}
+@media (max-width:520px){
+  .top-stats{display:none}
 }
 
 /* A flex child defaults to min-height:auto, so a pane grows to fit its
@@ -1547,16 +1555,16 @@ body.synth-on .rail,body.synth-on .drawer,body.synth-on .actionbar{visibility:hi
 <!-- TOPBAR -->
 <div class="topbar">
   <div class="logo">
-    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="3 11 22 2 13 21 11 13 3 11"/></svg>GPX <span style="font-size:9px;background:#ffc400;color:#fff;padding:1px 5px;border-radius:6px;font-weight:800;letter-spacing:.5px;vertical-align:2px">DEV</span>
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="3 11 22 2 13 21 11 13 3 11"/></svg>GPX <span class="logo-mark">GROK</span>
   </div>
   <div class="top-stats">
     <div class="tstat"><span class="tstat-l">Route</span><span class="tstat-v" id="h-dist">—</span></div>
     <div class="tdiv"></div>
     <div class="tstat"><span class="tstat-l">Stops</span><span class="tstat-v" id="h-stops">0/0</span></div>
-    <div class="tdiv"></div>
-    <div class="tstat"><span class="tstat-l">Planned</span><span class="tstat-v" id="h-prog">—</span></div>
-    <div class="tdiv"></div>
-    <div class="tstat"><span class="tstat-l">Actual</span><span class="tstat-v ok" id="h-real">—</span></div>
+    <div class="tdiv tdiv-opt"></div>
+    <div class="tstat tstat-opt"><span class="tstat-l">Planned</span><span class="tstat-v" id="h-prog">—</span></div>
+    <div class="tdiv tdiv-opt"></div>
+    <div class="tstat tstat-opt"><span class="tstat-l">Actual</span><span class="tstat-v ok" id="h-real">—</span></div>
   </div>
   <div class="top-actions">
     <button class="btn primary" onclick="el('gpx-file').click()" style="min-width:38px;padding:7px">📂</button>

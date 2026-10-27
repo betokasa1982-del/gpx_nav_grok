@@ -26,4 +26,4 @@ node runner.js
 
 ## Ícone
 
-`icon-192.png` e `icon-512.png` são o ícone desta revisão. O cache do service worker é `gpx-nav-v68-grok`, para o tablet não continuar com o ícone roxo DEV.
+`icon-192.png` e `icon-512.png` são o ícone desta revisão. O cache do service worker é `gpx-nav-v69-shell`, para o tablet não continuar com o ícone roxo DEV.

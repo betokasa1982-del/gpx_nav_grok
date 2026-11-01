@@ -1037,9 +1037,34 @@ body.cockpit #cockpit-exit{position:absolute!important;right:14px!important;
 body.cockpit #hud-voice{position:absolute!important;right:14px!important;
   top:216px!important;left:auto!important;bottom:auto!important}
 @media (max-width:820px){
-  body.cockpit #hud-instr{width:288px!important;padding:14px 16px 12px!important}
-  body.cockpit #nsc{width:288px!important;bottom:78px!important}
-  body.cockpit #nsc .nsc-photo{height:164px!important}
+  body.cockpit #hud-instr{
+    left:calc(var(--rail-w) + 8px)!important;right:8px!important;width:auto!important;
+    top:48px!important;padding:12px 12px 10px!important}
+  body.cockpit #hud-instr .ck-dist-row{padding-right:92px;max-width:100%}
+  body.cockpit #hud-instr .hud-instr-dist{font-size:40px!important}
+  body.cockpit #hud-instr .hud-instr-icon svg{width:64px!important;height:64px!important}
+  body.cockpit #cockpit-speed{
+    width:84px!important;height:84px!important;
+    top:52px!important;right:16px!important}
+  body.cockpit .cockpit-speed-value{font-size:32px!important;letter-spacing:0!important;line-height:1!important}
+  body.cockpit .cockpit-speed-target{display:none!important}
+  body.cockpit .gtabar,body.driver-mode .gtabar{
+    left:calc(var(--rail-w) + 8px)!important;right:8px!important;width:auto!important;
+    bottom:calc(var(--ab-h) + var(--safe-b) + 8px)!important}
+  body.cockpit #nsc{
+    left:calc(var(--rail-w) + 8px)!important;right:8px!important;width:auto!important;
+    bottom:calc(var(--ab-h) + var(--safe-b) + 168px)!important;
+    max-height:76px!important;padding:8px 12px!important;overflow:hidden!important}
+  body.cockpit #nsc .nsc-photo{display:none!important;height:0!important}
+  body.cockpit #nsc .nsc-name{font-size:16px!important;margin:0!important}
+  body.cockpit #nsc .nsc-dist{font-size:20px!important}
+  .gb-cell .gb-r{white-space:nowrap}
+  .gb-grid{gap:4px}
+  body.cockpit #actionbar,body.driver-mode #actionbar{
+    display:flex!important;justify-content:flex-end;align-items:center;gap:8px}
+  body.cockpit #peek-icon,body.cockpit .peek-left,body.cockpit #peek-dist,
+  body.driver-mode #peek-icon,body.driver-mode .peek-left,body.driver-mode #peek-dist{
+    display:none!important}
 }
 
 /* ══ VEHICLE CONTRAST ═════════════════════════════════════════════════════

@@ -989,7 +989,8 @@ body.cockpit .gtabar{display:block;position:absolute;
 .gb-cell{display:flex;flex-direction:column;align-items:center;gap:3px;
   padding:9px 2px 8px;border-radius:8px;background:rgba(255,255,255,.05);
   border:2px solid transparent;min-height:74px;justify-content:center}
-.gb-cell .gb-k{font-family:var(--mono);font-size:12px;letter-spacing:0;color:var(--muted)}
+.gb-cell .gb-k{font-family:var(--sans);font-size:12px;letter-spacing:0;color:var(--muted);
+  white-space:nowrap;max-width:100%;overflow:hidden;text-overflow:ellipsis}
 .gb-cell .gb-v{font-family:var(--mono);font-size:26px;font-weight:700;line-height:1;color:var(--text)}
 .gb-cell .gb-s{font-size:20px;font-weight:800;line-height:1}
 .gb-cell.in {border-color:var(--green);color:var(--green)}
@@ -1189,7 +1190,6 @@ body.cockpit #hud-voice{position:absolute!important;right:14px!important;
   .drawer{width:calc(100vw - var(--rail-w))}
   .rail-lbl{font-size:13px}
   .tstat-opt,.tdiv-opt{display:none}
-  .peek-sub{display:none}
 }
 @media (max-width:520px){
   .top-stats{display:none}
@@ -1252,6 +1252,30 @@ body.cockpit #hud-voice{position:absolute!important;right:14px!important;
 .gta-actions{display:flex;gap:var(--s-sm);margin-top:var(--s-lg)}
 .gta-actions .btn{flex:1;min-height:52px;font-size:14px}
 .gta-actions .gta-start{flex:2}
+
+/* Repeat report: original cycle against the drive that just finished. */
+.rep-report{position:fixed;inset:0;z-index:4500;background:rgba(7,7,7,.92);
+  display:none;align-items:center;justify-content:center;padding:16px}
+.rep-report.on{display:flex}
+.rep-sheet{width:min(560px,100%);max-height:88vh;overflow-y:auto;background:var(--panel);
+  border:1px solid var(--border);border-radius:12px;padding:16px;display:flex;flex-direction:column;gap:12px}
+.rep-head{display:flex;align-items:center;justify-content:space-between;
+  font-size:14px;font-weight:600;letter-spacing:1.6px;color:var(--accent)}
+.rep-score{font-family:var(--display);font-size:40px;font-weight:700;line-height:1}
+.rep-score.ok{color:var(--green)}
+.rep-score.warn{color:var(--warn)}
+.rep-note{font-size:14px;line-height:1.45;color:var(--muted)}
+.rep-table{width:100%;border-collapse:collapse}
+.rep-table th{font-size:12px;color:var(--muted);font-weight:600;text-align:right;padding:4px}
+.rep-table th:first-child,.rep-table td:first-child{text-align:left}
+.rep-table td{padding:8px 4px;border-top:1px solid var(--divider);text-align:right;
+  font-family:var(--mono);font-size:14px;color:var(--text)}
+.rep-in{color:var(--green);font-family:var(--sans);font-weight:700}
+.rep-out{color:var(--warn);font-family:var(--sans);font-weight:700}
+.rep-miss{font-size:14px;line-height:1.45}
+.rep-hist{font-size:13px;color:var(--muted);line-height:1.5}
+.rep-close{min-height:48px;width:100%}
+.rec-reps{margin-top:6px;min-height:36px;font-size:13px}
 
 /* ── LIVE CRITERION CARDS ────────────────────────────────────────────────
    Five cards down the left of the map (field request, 22 Sep: "cinco cards
@@ -1783,6 +1807,16 @@ body.synth-on .rail,body.synth-on .drawer,body.synth-on .actionbar{visibility:hi
   <div class="gta-cards" id="gta-live" style="display:none">
     <div class="gta-cards-head" id="gta-live-head"></div>
     <div class="gta-cards-list" id="gta-live-rows"></div>
+  </div>
+
+  <!-- Repeat report: original cycle compared with the drive just finished. -->
+  <div class="rep-report" id="rep-report" aria-hidden="true">
+    <div class="rep-sheet" role="dialog" aria-labelledby="rep-title">
+      <div class="rep-head"><span id="rep-title">REPEAT REPORT</span>
+        <button class="drawer-close" onclick="closeRepeatReport()" aria-label="Close">✕</button></div>
+      <div id="rep-body"></div>
+      <button class="btn go rep-close" onclick="closeRepeatReport()">CLOSE</button>
+    </div>
   </div>
 
   <!-- Recording indicator -->
@@ -2321,6 +2355,126 @@ function calcGTAScore(points,stopsArr){
   return{cls:best.cls,matched:best.matched,total:5,metrics:m,detail:best.detail};
 }
 
+/* How closely a repeat reproduced the original cycle.
+   Each criterion is scored by its distance from the original, in units of
+   that class window. 100 means the same five numbers. A difference as wide
+   as the window scores 0 on that row. */
+const REP_ROWS=[
+  {key:'spk', mk:'stopsKm', label:'Stops/km', dec:1, unit:''},
+  {key:'spd', mk:'avg',     label:'Avg speed', dec:1, unit:' km/h'},
+  {key:'dspd',mk:'drive',   label:'Drive speed', dec:1, unit:' km/h'},
+  {key:'vmax',mk:'vmax',    label:'Max speed', dec:0, unit:' km/h'},
+  {key:'idle',mk:'idlePct', label:'Idle', dec:0, unit:'%'},
+];
+function repeatCorrelation(orig, now, cls){
+  if(!orig||!now||!cls)return null;
+  const rows=REP_ROWS.map(spec=>{
+    const range=cls[spec.key];
+    const o=+orig[spec.mk], n=+now[spec.mk];
+    const width=Math.max((range[1]-range[0]), 0.01);
+    const delta=(Number.isFinite(n)&&Number.isFinite(o))?n-o:null;
+    const closeness=delta==null?null:Math.max(0, 1-Math.abs(delta)/width);
+    return {key:spec.key, label:spec.label, dec:spec.dec, unit:spec.unit,
+      orig:Number.isFinite(o)?o:null, now:Number.isFinite(n)?n:null, delta, range, closeness,
+      inn:Number.isFinite(n)&&n>=range[0]&&n<=range[1]};
+  });
+  const scored=rows.filter(r=>r.closeness!=null);
+  if(!scored.length)return null;
+  return {score:Math.round(scored.reduce((s,r)=>s+r.closeness,0)/scored.length*100), rows};
+}
+function repEsc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&','<':'<','>':'>','"':'"'}[c]));}
+function repNum(n,dec){
+  if(!Number.isFinite(+n))return '—';
+  return dec? (+n).toFixed(dec) : String(Math.round(+n));
+}
+function repDelta(n,dec){
+  if(!Number.isFinite(+n))return '—';
+  const body=repNum(Math.abs(n),dec);
+  return (n>0?'+':n<0?'−':'')+body;
+}
+function saveRepeatReport(repeat, missed){
+  const idx=typeof currentLoadedRec==='number'?currentLoadedRec:-1;
+  const rec=idx>=0?savedRecs[idx]:null;
+  const cls=VBC_CLASSES.find(c=>c.id===repeat.cls)||null;
+  const orig=rec&&rec.score&&rec.score.metrics?rec.score.metrics:null;
+  const corr=repeatCorrelation(orig, repeat.metrics, cls);
+  const entry={
+    t:Date.now(), cls:repeat.cls, matched:repeat.matched,
+    corr:corr?corr.score:null, metrics:repeat.metrics,
+    missed:missed||[], served:repeatStopsCounted()
+  };
+  if(rec){
+    rec.repeats=Array.isArray(rec.repeats)?rec.repeats:[];
+    rec.repeats.push(entry);
+    if(rec.repeats.length>20)rec.repeats.splice(0, rec.repeats.length-20);
+    try{saveRecordings();}catch(e){}
+    paintRepeatLine(idx);
+  }
+  return {rec, entry, corr, cls, orig};
+}
+function repeatReportHTML(view){
+  const {rec, entry, corr, cls}=view;
+  const name=rec&&rec.name?repEsc(rec.name):'This route';
+  const score=corr?corr.score:null;
+  const head=score==null
+    ? `<div class="rep-note">${name} · ${repEsc(entry.cls)} ${entry.matched}/5. The original cycle has no saved metrics, so there is no reproduction score.</div>`
+    : `<div class="rep-score ${score>=80?'ok':'warn'}">${score}%</div>
+       <div class="rep-note">${name} · class ${repEsc(entry.cls)} · ${entry.matched}/5 inside the class. Reproduction is how close this repeat is to the original, measured on each class window. 100% is the same five numbers.</div>`;
+  const bodyRows=(corr?corr.rows:REP_ROWS.map(spec=>{
+    const range=cls?cls[spec.key]:null;
+    const n=+entry.metrics[spec.mk];
+    return {label:spec.label, dec:spec.dec, unit:spec.unit, orig:null, now:n, delta:null, range,
+      inn:range?n>=range[0]&&n<=range[1]:null};
+  })).map(r=>{
+    const range=r.range?`${repNum(r.range[0],r.dec)}–${repNum(r.range[1],r.dec)}`:'—';
+    const flag=r.inn==null?'—':r.inn?'<span class="rep-in">IN</span>':'<span class="rep-out">OUT</span>';
+    return `<tr><td>${r.label}</td><td>${r.orig==null?'—':repNum(r.orig,r.dec)}</td><td>${repNum(r.now,r.dec)}</td><td>${r.delta==null?'—':repDelta(r.delta,r.dec)}</td><td>${range}</td><td>${flag}</td></tr>`;
+  }).join('');
+  const missed=entry.missed&&entry.missed.length
+    ? `<div class="rep-miss"><b>Missed stops.</b> ${entry.missed.map(repEsc).join(', ')}</div>`
+    : `<div class="rep-miss">No missed stops.</div>`;
+  const hist=rec&&Array.isArray(rec.repeats)&&rec.repeats.length
+    ? `<div class="rep-hist">${rec.repeats.slice().reverse().slice(0,8).map(x=>{
+        const when=new Date(x.t);
+        const hm=isNaN(when)? '' : when.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'});
+        return `${hm} · ${x.matched}/5${x.corr==null?'':' · '+x.corr+'%'}`;
+      }).join('<br>')}</div>`
+    : '';
+  return head+
+    `<table class="rep-table"><thead><tr><th>Criterion</th><th>Original</th><th>Repeat</th><th>Δ</th><th>Class</th><th></th></tr></thead><tbody>${bodyRows}</tbody></table>`+
+    missed+hist;
+}
+function showRepeatReport(view){
+  const box=el('rep-report'), body=el('rep-body');
+  if(!box||!body||!view)return;
+  body.innerHTML=repeatReportHTML(view);
+  box.classList.add('on');
+  box.setAttribute('aria-hidden','false');
+}
+function closeRepeatReport(){
+  const box=el('rep-report');
+  if(!box)return;
+  box.classList.remove('on');
+  box.setAttribute('aria-hidden','true');
+}
+function openRepeatReport(idx){
+  const rec=savedRecs[idx];
+  if(!rec||!rec.repeats||!rec.repeats.length)return;
+  const entry=rec.repeats[rec.repeats.length-1];
+  const cls=VBC_CLASSES.find(c=>c.id===entry.cls)||null;
+  const orig=rec.score&&rec.score.metrics?rec.score.metrics:null;
+  showRepeatReport({rec, entry, cls, orig, corr:repeatCorrelation(orig, entry.metrics, cls)});
+}
+function paintRepeatLine(idx){
+  const rec=savedRecs[idx], host=el('rcard-reps-'+idx);
+  if(!host)return;
+  const reps=rec&&Array.isArray(rec.repeats)?rec.repeats:[];
+  if(!reps.length){host.style.display='none';host.textContent='';return;}
+  const last=reps[reps.length-1];
+  host.style.display='';
+  host.textContent=`Last repeat ${last.matched}/5${last.corr==null?'':' · '+last.corr+'% of the original'} · ${reps.length} saved`;
+}
+
 // Per-segment average speeds between recorded stops (for replay pacing)
 function calcSegments(points,stops){
   if(!points?.length||!stops?.length)return[];
@@ -2504,6 +2658,7 @@ function saveRecsMirror(){
         date:r.date instanceof Date?r.date.toISOString():r.date,
         elev:r.elev??null, time_s:r.time_s??null, score:r.score??null,
         target:r.target||null,
+        repeats:Array.isArray(r.repeats)?r.repeats.slice(-20):[],
         points:r.points.map(p=>({lat:p.lat,lng:p.lng,t:p.t,
           ...(p.alt!=null&&!isNaN(+p.alt)?{alt:Math.round(p.alt*10)/10}:{})})),
         stops:r.stops.map(s=>({lat:s.lat,lng:s.lng,t:s.t,dur_s:s.dur_s,
@@ -3856,10 +4011,11 @@ function exitNavigation(){
   stopNav();
 }
 function stopNav(){
-  // The repeat check is the reason this screen exists. Say whether the drive
-  // that just finished sat inside the loaded class before the cockpit goes away.
-  let repeat=null;
+  // The repeat check is the reason this screen exists. Capture it before the
+  // cockpit is torn down, then keep the attempt on the recording.
+  let repeat=null, missed=[];
   try{repeat=repeatResult();}catch(e){}
+  try{missed=stops.filter(s=>s.missed).map(s=>s.name||('Stop '+s.id));}catch(e){}
   stopWatch();
   navActive=false;
   document.body.classList.remove('driver-mode');
@@ -3883,15 +4039,20 @@ function stopNav(){
   if(!isRec) releaseWakeLock();
   setGPS('wait','GPS stopped');
   if(repeat){
+    const view=saveRepeatReport(repeat, missed);
     const ok=repeat.matched===5;
+    const corr=view&&view.corr?view.corr.score:null;
     const msg=ok
-      ? `✓ ${repeat.cls} met ${repeat.matched}/5`
-      : `${repeat.cls} ${repeat.matched}/5 — outside the class`;
+      ? `✓ ${repeat.cls} met ${repeat.matched}/5${corr==null?'':' · '+corr+'% of the original'}`
+      : `${repeat.cls} ${repeat.matched}/5 — outside the class${corr==null?'':' · '+corr+'% of the original'}`;
     showAlert(ok?'arrived':'missed', msg);
-    try{speakText(ok?`Class ${repeat.cls} met, 5 of 5.`:`Class ${repeat.cls}, ${repeat.matched} of 5. Outside the class.`,true);}catch(e){}
+    try{speakText(ok
+      ? `Class ${repeat.cls} met, 5 of 5.${corr==null?'':' Reproduction '+corr+' percent.'}`
+      : `Class ${repeat.cls}, ${repeat.matched} of 5. Outside the class.${corr==null?'':' Reproduction '+corr+' percent.'}`,true);}catch(e){}
     const sub=el('peek-sub');
     if(sub)sub.textContent=msg;
     showClassLabel(msg);
+    showRepeatReport(view);
   }
 }
 
@@ -5220,9 +5381,9 @@ function renderPlaybackGTA(){
    value and a glyph saying which way to move it — ↑ raise, ↓ lower, ✓ inside
    the class range. The range itself stays in the LIVE CYCLE panel; at the
    wheel the direction is the actionable part. */
-const GB_KEYS=[{k:'spk',lbl:'S/KM',dec:1},{k:'spd',lbl:'AVG',dec:0},
-               {k:'dspd',lbl:'DRV',dec:0},{k:'vmax',lbl:'MAX',dec:0},
-               {k:'idle',lbl:'IDLE',dec:0}];
+const GB_KEYS=[{k:'spk',lbl:'Stops',dec:1},{k:'spd',lbl:'Avg',dec:0},
+               {k:'dspd',lbl:'Drive',dec:0},{k:'vmax',lbl:'Max',dec:0},
+               {k:'idle',lbl:'Idle',dec:0}];
 function renderGTABar(rows,val,ok,ready){
   const g=el('gb-grid'),c=el('gb-cls'),sc=el('gb-score');
   if(!g||!c||!sc)return;
@@ -6354,6 +6515,7 @@ function renderRecCard(rec,idx){
         <div class="rec-card-meta">${(rec.dist??0).toFixed(2)} km · ${fmtDur(dur)} · ${rec.stops.length} stop${rec.stops.length===1?'':'s'}${rec.elev!=null?' · ⛰ +'+rec.elev+' m':''}</div>
         <div class="rec-card-meta">${sc?.metrics?`Ø ${sc.metrics.avg} · drv ${sc.metrics.drive} · max ${sc.metrics.vmax} km/h · ${sc.metrics.stopsKm} st/km · idle ${sc.metrics.idlePct}%`:''} ${isNaN(dt)?'':'· '+dt.toLocaleDateString('en-GB')}</div>
         ${aim}
+        <button class="btn rec-reps" id="rcard-reps-${idx}" style="display:none" onclick="openRepeatReport(${idx})"></button>
       </div>
     </div>
     <div class="rec-card-btns">
@@ -6371,6 +6533,7 @@ function renderRecCard(rec,idx){
         onclick="delRec(${idx})">🗑 Delete</button>
     </div>`;
   list.insertBefore(card,list.firstChild);
+  paintRepeatLine(idx);
 }
 
 function loadRec(idx){

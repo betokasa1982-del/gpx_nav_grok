@@ -5474,3 +5474,21 @@ __group('Synthetic cycle v2 tests');
 })();
 __group('Class repeat fixes');
 
+// ── Repeat correlation: original cycle vs the drive just finished ──
+(()=>{
+  const cls=VBC_CLASSES.find(c=>c.id==='Ci2');
+  const orig={stopsKm:3.5, avg:19, drive:28, vmax:55, idlePct:30};
+  const same=repeatCorrelation(orig, orig, cls);
+  console.assert(same&&same.score===100,'REP-1: an identical repeat is not 100: '+(same&&same.score));
+  const off=Object.assign({}, orig, {vmax:orig.vmax+(cls.vmax[1]-cls.vmax[0])});
+  const moved=repeatCorrelation(orig, off, cls);
+  const vmax=moved.rows.find(r=>r.key==='vmax');
+  console.assert(moved.score===80&&vmax.closeness===0&&vmax.inn===false,
+    'REP-1: one full window away should zero only that row: '+JSON.stringify(moved&&{score:moved.score,vmax}));
+  console.assert(repeatCorrelation(null, orig, cls)===null,'REP-1: missing original still scored');
+  console.assert(/Stops/.test(GB_KEYS.map(k=>k.lbl).join(' '))&&!GB_KEYS.some(k=>k.lbl==='S/KM'),
+    'REP-1: the live bar still uses the S/KM abbreviation');
+  console.log('REP-1. repeat correlation OK');
+})();
+__group('Repeat correlation');
+

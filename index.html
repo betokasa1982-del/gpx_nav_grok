@@ -616,14 +616,14 @@ body.at-stop .nsc{display:none!important}          /* one stop surface, not two 
 .sc-prog-bg{height:5px;background:rgba(255,255,255,.06);border-radius:4px;overflow:hidden}
 .sc-prog-fill{height:100%;border-radius:4px;transition:width .5s,background .5s;min-width:2px}
 .sc-ctrl{display:flex;align-items:center;gap:7px;padding:0 12px 10px}
-.tbtn{width:36px;height:36px;border-radius:50%;border:none;display:flex;align-items:center;justify-content:center;cursor:pointer;font-size:13px;flex-shrink:0}
+.tbtn{width:44px;height:44px;border-radius:50%;border:none;display:flex;align-items:center;justify-content:center;cursor:pointer;font-size:14px;flex-shrink:0}
 .tbtn:active{transform:scale(.88)}
 .tbtn.go {background:rgba(63,185,80,.15);color:var(--green)}
 .tbtn.ps {background:rgba(240,165,0,.15);color:var(--accent)}
 .tbtn.rst{background:rgba(248,81,73,.08);color:var(--muted)}
 .sc-btns{display:flex;gap:5px;flex:1;justify-content:flex-end}
-.sc-btn{font-size:13px;padding:6px 8px;min-height:32px;border-radius:4px;cursor:pointer;
-  border:1px solid var(--border);background:transparent;color:var(--muted);font-family:var(--sans);
+.sc-btn{font-size:13px;padding:6px 8px;min-height:44px;border-radius:8px;cursor:pointer;
+  border:1px solid var(--border-strong);background:var(--panel2);color:var(--text);font-family:var(--sans);
   font-weight:700;letter-spacing:.5px;text-transform:uppercase}
 .sc-btn:active{opacity:.6}
 .stops-bar{padding:10px 12px;border-top:1px solid var(--border);display:flex;gap:6px;flex-shrink:0}
@@ -1107,13 +1107,14 @@ body.cockpit #hud-voice{position:absolute!important;right:14px!important;
    numerals shifting width as values change — the "visual jitter during
    fast updates" the 8pt-grid rule is there to prevent.                  */
 .nsc-dist,.hud-instr-dist,.hud-spd-val,.cockpit-speed-value,
-.lcm-v,.sc-time-val,.peek-dist,.hud-sr-timer{
+.lcm-v,.peek-dist,.hud-sr-timer{
   font-family:var(--display);font-variant-numeric:tabular-nums;letter-spacing:-.5px}
 .nsc-dist{font-size:52px;font-weight:700;line-height:.9}
 .hud-spd-val{font-size:34px;font-weight:700}
 .peek-dist{font-size:20px;font-weight:600}
 .lcm-v{font-size:24px;font-weight:600}
-.sc-time-val{font-size:24px;font-weight:600}
+.sc-time-val{font-family:var(--mono);font-variant-numeric:tabular-nums;letter-spacing:0;
+  font-size:18px;font-weight:700}
 /* Section labels: IBM Plex Sans, wide tracking, never competing with data */
 .nsc-head,.hud-icon-lbl,.hud-tgt,.cockpit-speed-unit,.cockpit-speed-target,
 .rec-label,.tstat-l,.sb-lbl{font-family:var(--sans);letter-spacing:1.2px}
@@ -1186,10 +1187,22 @@ body.cockpit #hud-voice{position:absolute!important;right:14px!important;
 .sheet-handle,.sheet-tabs,.stab{display:none!important}
 
 @media (max-width:640px){
-  :root{--rail-w:80px}
+  :root{--rail-w:80px;--ab-h:108px}
   .drawer{width:calc(100vw - var(--rail-w))}
   .rail-lbl{font-size:13px}
   .tstat-opt,.tdiv-opt{display:none}
+  .actionbar{display:grid;grid-template-columns:auto 1fr auto;grid-template-rows:auto auto;
+    align-items:center;column-gap:8px;row-gap:2px;height:calc(var(--ab-h) + var(--safe-b));padding-top:6px}
+  #peek-icon,.peek-dist{display:none}
+  .peek-left{grid-column:1 / -1}
+  .lap-chip{grid-row:2;grid-column:1;justify-self:start;margin-left:0}
+  .big-start{grid-row:2;grid-column:3;justify-self:end}
+  .seq-peek{grid-row:2;grid-column:2}
+  .sc-times{margin:0 8px 6px}
+  .sc-time-col{padding:6px 8px;min-width:0}
+  .sc-time-label{letter-spacing:0}
+  .sc-head{padding:8px 8px 4px;gap:6px}
+  .sc-ctrl{padding:0 8px 8px}
 }
 @media (max-width:520px){
   .top-stats{display:none}
@@ -2028,7 +2041,7 @@ body.synth-on .rail,body.synth-on .drawer,body.synth-on .actionbar{visibility:hi
         </div>
       </div>
       <div class="stops-bar">
-        <button class="btn go" onclick="startAllTimers()">▶ Todos</button>
+        <button class="btn go" onclick="startAllTimers()">▶ All</button>
         <button class="btn"    onclick="resetAllTimers()">↺ Reset</button>
         <button class="btn"    onclick="exportCSV()">↓ CSV</button>
       </div>
@@ -3604,12 +3617,12 @@ function cardHTML(s){
   <div class="sc-times">
     <div class="sc-time-col">
       <div class="sc-time-label">PLANNED</div>
-      <div class="sc-time-val">${hp?fmtTime(s.dur_s):'—'}</div>
+      <div class="sc-time-val">${hp?fmtStopTime(s.dur_s):'—'}</div>
       ${hp?`<div class="sc-delta" id="scd-${s.id}"></div>`:''}
     </div>
     <div class="sc-time-col real">
       <div class="sc-time-label">ACTUAL</div>
-      <div class="sc-time-val" id="td-${s.id}">00:00:00</div>
+      <div class="sc-time-val" id="td-${s.id}">0:00</div>
     </div>
   </div>
   ${hp?`<div class="sc-prog"><div class="sc-prog-bg"><div class="sc-prog-fill" id="scb-${s.id}" style="width:0%;background:var(--green)"></div></div></div>`:''}
@@ -3633,7 +3646,7 @@ function updCardProgress(s){
   if(bar){bar.style.width=Math.min(pct,100)+'%';bar.style.background=pct<90?'var(--green)':pct<100?'var(--accent)':'var(--red)'}
   const delta=s.elapsed-s.dur_s;
   const dEl=el(`scd-${s.id}`);
-  if(dEl&&s.elapsed>0){dEl.className=`sc-delta ${delta<=0?'ok':delta<60?'warn':'over'}`;dEl.textContent=delta<=0?`−${fmtTime(-delta)} ahead`:`+${fmtTime(delta)} delay`}
+  if(dEl&&s.elapsed>0){dEl.className=`sc-delta ${delta<=0?'ok':delta<60?'warn':'over'}`;dEl.textContent=delta<=0?`−${fmtStopTime(-delta)} ahead`:`+${fmtStopTime(delta)} delay`}
   const tdEl=el(`td-${s.id}`);
   if(tdEl)tdEl.className=`sc-time-val${s.running?' running':s.elapsed>0?' paused':''}${delta>0&&s.elapsed>0?' over':''}`;
 }
@@ -3663,7 +3676,7 @@ function startTimer(id){
   s.running=true;s.state='current';
   s.intervalId=setInterval(()=>{
     s.elapsed++;
-    const d=el(`td-${id}`);if(d)d.textContent=fmtTime(s.elapsed);
+    const d=el(`td-${id}`);if(d)d.textContent=fmtStopTime(s.elapsed);
     updCardProgress(s);updTotals();if(hudPanelOpen)renderHudPanel();
     // Auto-complete when planned time is reached
     if(s.dur_s>0&&s.elapsed>=s.dur_s&&s.running){
@@ -3690,7 +3703,7 @@ function pauseTimer(id){
 function resetTimer(id){
   pauseTimer(id);const s=stops.find(s=>s.id===id);if(!s)return;
   s.elapsed=0;s.state='waiting';s.missed=false;s.untimed=false;
-  const d=el(`td-${id}`);if(d){d.textContent='00:00:00';d.className='sc-time-val'}
+  const d=el(`td-${id}`);if(d){d.textContent='0:00';d.className='sc-time-val'}
   const bar=el(`scb-${id}`);if(bar)bar.style.width='0%';
   const dEl=el(`scd-${id}`);if(dEl)dEl.textContent='';
   updCardState(s);updTotals();updSummaryBar();
@@ -6826,6 +6839,13 @@ function brng(la1,lo1,la2,lo2){
 function calcDist(pts){let t=0;for(let i=1;i<pts.length;i++)t+=haversine(pts[i-1].lat,pts[i-1].lon,pts[i].lat,pts[i].lon);return t}
 function calcDistRaw(pts){let t=0;for(let i=1;i<pts.length;i++)t+=haversine(pts[i-1].lat,pts[i-1].lng,pts[i].lat,pts[i].lng);return t}
 function fmtTime(s){if(!s||isNaN(s))return'00:00:00';s=Math.max(0,Math.floor(s));const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sc=s%60;return[h,m,sc].map(v=>String(v).padStart(2,'0')).join(':')}
+function fmtStopTime(s){
+  if(!s||isNaN(s))return'0:00';
+  s=Math.max(0,Math.floor(s));
+  const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sc=s%60;
+  const p=n=>String(n).padStart(2,'0');
+  return h?`${h}:${p(m)}:${p(sc)}`:`${m}:${p(sc)}`;
+}
 function fmtDurMs(ms){return fmtTime(Math.floor(ms/1000))}
 function el(id){return document.getElementById(id)}
 function setGPS(state,msg){el('gps-dot').className='gps-dot '+state;el('gps-text').textContent=msg}

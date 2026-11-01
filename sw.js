@@ -1,6 +1,6 @@
 // GPX Navigator Pro — Service Worker
 // Versão do cache: incrementar ao atualizar os arquivos
-const CACHE = "gpx-nav-v69-shell";
+const CACHE = "gpx-nav-v70-install";
 const ASSETS = [
   "./",
   "./index.html",
@@ -53,6 +53,19 @@ self.addEventListener("fetch", e => {
           return res;
         })
         .catch(() => caches.match(e.request))
+    );
+    return;
+  }
+
+  // A página e o manifesto vêm da rede primeiro, senão o telefone
+  // fica preso na versão antiga e o botão de instalar nunca aparece.
+  if (e.request.mode === "navigate" || /\/(index\.html|manifest\.json|sw\.js)$/.test(url)) {
+    e.respondWith(
+      fetch(e.request).then(res => {
+        const clone = res.clone();
+        caches.open(CACHE).then(c => c.put(e.request, clone));
+        return res;
+      }).catch(() => caches.match(e.request))
     );
     return;
   }

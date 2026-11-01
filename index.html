@@ -1536,6 +1536,7 @@ body.synth-on .rail,body.synth-on .drawer,body.synth-on .actionbar{visibility:hi
 .syn-resv{font-family:var(--display);font-size:56px;font-weight:700;line-height:1}
 .syn-resv.ok{color:var(--green)}.syn-resv.warn{color:var(--warn)}.syn-resv.bad{color:var(--red)}
 .syn-resm{font-family:var(--mono);font-size:13px;color:var(--muted);text-align:right;line-height:1.5}
+.syn-note{font-size:14px;line-height:1.45;color:var(--text);background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:10px 12px}
 .syn-reskpi{display:grid;grid-template-columns:repeat(5,1fr);gap:8px}
 .syn-reskpi div{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:8px 10px}
 .syn-reskpi b{display:block;font-family:var(--display);font-size:30px;font-weight:700}
@@ -6763,6 +6764,7 @@ const SYN_I18N={
   'res.dist':'Distance','res.stopErr':'Mean stop error','res.speedPlot':'Speed — reference vs actual',
   'res.accPlot':'Acceleration — reference vs actual','res.close':'CLOSE','res.exportAll':'💾 SAVE TO TABLET','res.saved':'Saved to Downloads:','res.saveFail':'Could not save:',
   'res.seg':'Seg','res.verdict':'Verdict','res.noAcc':'no accel data','res.distErr':'Distance error at end',
+  'res.parked':'Almost no movement ({dist} m). The orange line is the cycle you chose, not your speed. The blue line is the phone GPS — indoors, with no open sky, it invents a speed.',
   'v.VALID':'VALID','v.CHECK':'CHECK','v.INCOMPLETE':'INCOMPLETE','v.OK':'OK',
   'e.name':'Name the cycle','e.laps':'Laps must be a whole number {min}–{max}','e.range':'Must be {min}–{max}',
   'e.num':'Not a number','e.noSegs':'Add at least one segment','e.tooMany':'At most {max} segments',
@@ -6822,6 +6824,7 @@ const SYN_I18N={
   'res.dist':'Sträcka','res.stopErr':'Medel stoppfel','res.speedPlot':'Hastighet — referens mot aktuell',
   'res.accPlot':'Acceleration — referens mot aktuell','res.close':'STÄNG','res.exportAll':'💾 SPARA PÅ SURFPLATTAN','res.saved':'Sparad i Hämtade filer:','res.saveFail':'Kunde inte spara:',
   'res.seg':'Seg','res.verdict':'Bedömning','res.noAcc':'ingen acc.-data','res.distErr':'Sträckfel vid slut',
+  'res.parked':'Nästan ingen förflyttning ({dist} m). Orange är cykeln du valde, inte din hastighet. Blå är telefonens GPS — inomhus, utan fri sikt, hittar den på en hastighet.',
   'v.VALID':'GODKÄND','v.CHECK':'KONTROLLERA','v.INCOMPLETE':'OFULLSTÄNDIG','v.OK':'OK',
   'e.name':'Namnge cykeln','e.laps':'Varv måste vara ett heltal {min}–{max}','e.range':'Måste vara {min}–{max}',
   'e.num':'Inte ett tal','e.noSegs':'Lägg till minst ett segment','e.tooMany':'Högst {max} segment',
@@ -8684,6 +8687,7 @@ Object.assign(Synth,{
         ${k(synMMSS(S.durationS),synT('res.dur'))}${k((S.distanceM/1000).toFixed(3)+' km',synT('res.dist'))}
         ${D.mode==='position'?k(synFix(S.meanAbsStopErr,1)+' m',synT('res.stopErr')):k(synSigned(S.finalDistErr,1)+' m',synT('res.distErr'))}
       </div>
+      ${(!D.meta.sim&&S.distanceM<50&&S.durationS>=8&&D.rows.some(r=>r[SYN_C.Reference_Speed_kmh]>=15))?`<p class="syn-note">${synT('res.parked',{dist:Math.round(S.distanceM)})}</p>`:''}
       <div class="syn-resplots"><div><span>${synT('res.speedPlot')}</span><canvas id="syn-rp1"></canvas></div>
         <div><span>${synT('res.accPlot')}</span><canvas id="syn-rp2"></canvas></div></div>
       <div class="syn-restab"><table><thead><tr><th>${synT('res.seg')}</th><th></th><th>km/h</th><th>%v</th><th>%a</th><th>RMSE v</th><th>RMSE a</th><th>a ref / meas</th><th>stop m</th><th>${synT('res.verdict')}</th></tr></thead><tbody>${segRows}</tbody></table></div>

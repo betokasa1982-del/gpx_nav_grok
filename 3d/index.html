@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#070707">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="GPX 3D">
+<title>GPX Navigator 3D</title>
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon-192.png">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/maplibre-gl@5.6.1/dist/maplibre-gl.css">
+<style>
+:root{
+  --bg:#070707;--card:#1b1b1b;--line:#333;--text:#f5f5f5;--dim:#a3a3a3;
+  --accent:#ff6a00;--green:#00e676;--blue:#00b0ff;--red:#ff1744;
+  --safe-b:env(safe-area-inset-bottom,0px);--safe-t:env(safe-area-inset-top,0px);
+}
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+html,body{height:100%;background:var(--bg);color:var(--text);
+  font-family:"Segoe UI",system-ui,sans-serif}
+#map{position:fixed;inset:0}
+.maplibregl-ctrl-attrib{font-size:10px}
+.maplibregl-ctrl-bottom-left{bottom:calc(76px + var(--safe-b));left:8px}
+
+.veh{width:28px;height:28px;border-radius:50%;background:#fff;border:3px solid var(--accent);
+  box-shadow:0 0 0 6px rgba(255,106,0,.25);position:relative}
+.veh:after{content:"";position:absolute;left:50%;top:-10px;transform:translateX(-50%);
+  border-left:7px solid transparent;border-right:7px solid transparent;border-bottom:12px solid var(--accent)}
+
+.card{position:absolute;background:var(--card);border:1px solid var(--line);border-radius:12px;
+  z-index:2;pointer-events:auto}
+#maneuver{left:8px;top:calc(48px + var(--safe-t));width:min(300px,calc(100vw - 112px));
+  padding:10px 12px 8px;display:none}
+#maneuver .dist{font-size:40px;font-weight:800;line-height:1;letter-spacing:0}
+#maneuver .act{margin-top:2px;font-size:16px;font-weight:800;letter-spacing:.4px;color:var(--accent);
+  text-transform:uppercase}
+#maneuver .road{margin-top:2px;font-size:13px;color:#e0e0e0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#maneuver .bar{margin-top:8px;height:4px;background:rgba(255,255,255,.12);border-radius:4px;overflow:hidden}
+#maneuver .bar i{display:block;height:100%;width:0;background:var(--accent)}
+#maneuver .foot{display:flex;justify-content:space-between;margin-top:6px;font-size:13px;font-weight:700}
+#speed{right:10px;top:calc(48px + var(--safe-t));width:88px;height:88px;border-radius:50%;
+  display:none;flex-direction:column;align-items:center;justify-content:center}
+#speed b{font-size:32px;line-height:1;font-variant-numeric:tabular-nums}
+#speed span{font-size:11px;color:var(--dim)}
+.brand{position:absolute;left:10px;top:calc(8px + var(--safe-t));z-index:3;
+  display:flex;align-items:center;gap:6px;font-weight:800;font-size:13px}
+.mark{background:#ffc400;color:#000;border-radius:8px;padding:1px 5px;font-size:12px}
+#gps{position:absolute;left:108px;top:calc(8px + var(--safe-t));z-index:3;
+  background:#111;border:1px solid var(--line);border-radius:12px;padding:3px 8px;font-size:12px;font-weight:700}
+#gps i{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--dim);margin-right:4px}
+#gps.ok i{background:var(--green)}
+#gps.bad i{background:var(--red)}
+#orient{position:absolute;left:8px;bottom:calc(168px + var(--safe-b));z-index:3;display:none;
+  background:var(--card);border:1px solid var(--line);border-radius:999px;color:var(--text);
+  padding:6px 10px;font-size:12px;font-weight:800;letter-spacing:.4px}
+.bar-bottom{position:absolute;left:0;right:0;bottom:0;z-index:4;
+  display:flex;gap:8px;justify-content:flex-end;align-items:center;
+  padding:10px 10px calc(10px + var(--safe-b));
+  background:linear-gradient(transparent,#070707 40%)}
+button{font:inherit;cursor:pointer;border-radius:12px;border:1px solid var(--line);
+  background:#1b1b1b;color:var(--text);min-height:44px;padding:0 14px;font-weight:800;font-size:13px}
+button.go{background:var(--green);color:#000;border-color:var(--green)}
+button.stop{background:var(--red);color:#fff;border-color:var(--red)}
+button.rec.on{background:var(--accent);color:#000;border-color:var(--accent)}
+#sheet{position:absolute;left:8px;right:8px;bottom:calc(72px + var(--safe-b));z-index:5;
+  background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px;
+  max-height:46vh;overflow:auto;display:none}
+#sheet h2{font-size:13px;letter-spacing:.6px;color:var(--accent);margin-bottom:8px}
+#sheet li{list-style:none;display:flex;justify-content:space-between;gap:8px;
+  padding:8px 0;border-top:1px solid var(--line);font-size:14px}
+#sheet li button{min-height:36px}
+.hint{position:absolute;left:8px;right:8px;top:50%;transform:translateY(-50%);z-index:2;
+  text-align:center;color:var(--dim);font-size:14px;pointer-events:none}
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div class="brand">GPX <span class="mark">3D</span></div>
+<div id="gps"><i></i>GPS</div>
+<section class="card" id="maneuver">
+  <div class="dist" id="dist">—</div>
+  <div class="act" id="act">Waiting for GPS</div>
+  <div class="road" id="road"></div>
+  <div class="bar"><i id="fill"></i></div>
+  <div class="foot"><span id="left">—</span><span id="eta">—</span></div>
+</section>
+<div class="card" id="speed"><b id="spd">0</b><span>km/h</span></div>
+<button id="orient" type="button">HEADING UP</button>
+<p class="hint" id="hint">Load a GPX or press Drive. The camera pitches when you move.</p>
+<div id="sheet">
+  <h2>SAVED ROUTES</h2>
+  <ul id="saved"></ul>
+</div>
+<div class="bar-bottom">
+  <button type="button" id="btn-routes">ROUTES</button>
+  <button type="button" id="btn-load">LOAD GPX</button>
+  <button type="button" id="btn-rec">RECORD</button>
+  <button type="button" class="go" id="btn-go">DRIVE</button>
+</div>
+<input id="file" type="file" accept=".gpx,application/gpx+xml" hidden>
+<script src="https://cdn.jsdelivr.net/npm/maplibre-gl@5.6.1/dist/maplibre-gl.js"></script>
+<script>
+const STYLE = "https://tiles.openfreemap.org/styles/liberty";
+const $ = id => document.getElementById(id);
+let map, marker, watchId = null;
+let route = null;
+let recording = false;
+let recPts = [];
+let driving = false;
+let orient = "HEADING";
+let heading = null;
+let speedKmh = 0;
+let userMoved = false;
+let lastFix = null;
+
+const empty = {type:"FeatureCollection", features:[]};
+
+function haversine(aLat, aLng, bLat, bLng){
+  const R = 6371000, r = Math.PI / 180;
+  const dLat = (bLat - aLat) * r, dLng = (bLng - aLng) * r;
+  const s = Math.sin(dLat / 2) ** 2 + Math.cos(aLat * r) * Math.cos(bLat * r) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(s)));
+}
+function bearing(aLat, aLng, bLat, bLng){
+  const r = Math.PI / 180;
+  const y = Math.sin((bLng - aLng) * r) * Math.cos(bLat * r);
+  const x = Math.cos(aLat * r) * Math.sin(bLat * r) - Math.sin(aLat * r) * Math.cos(bLat * r) * Math.cos((bLng - aLng) * r);
+  return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
+}
+function turnDelta(from, to){
+  return ((to - from + 540) % 360) - 180;
+}
+
+function lineFeature(pts){
+  return {type:"Feature", properties:{}, geometry:{type:"LineString", coordinates:pts.map(p => [p.lng, p.lat])}};
+}
+function setLine(id, pts){
+  const src = map.getSource(id);
+  if (!src) return;
+  src.setData(pts.length > 1 ? lineFeature(pts) : empty);
+}
+
+function buildRoute(pts){
+  const cum = [0];
+  const bear = [];
+  for (let i = 1; i < pts.length; i++){
+    cum.push(cum[i - 1] + haversine(pts[i - 1].lat, pts[i - 1].lng, pts[i].lat, pts[i].lng));
+    bear.push(bearing(pts[i - 1].lat, pts[i - 1].lng, pts[i].lat, pts[i].lng));
+  }
+  return {pts, cum, bear, total: cum[cum.length - 1]};
+}
+
+function nearestIndex(lat, lng){
+  let best = 0, bestD = Infinity;
+  const step = Math.max(1, Math.floor(route.pts.length / 800));
+  for (let i = 0; i < route.pts.length; i += step){
+    const d = haversine(lat, lng, route.pts[i].lat, route.pts[i].lng);
+    if (d < bestD){ bestD = d; best = i; }
+  }
+  const a = Math.max(0, best - step), b = Math.min(route.pts.length - 1, best + step);
+  bestD = Infinity;
+  for (let i = a; i <= b; i++){
+    const d = haversine(lat, lng, route.pts[i].lat, route.pts[i].lng);
+    if (d < bestD){ bestD = d; best = i; }
+  }
+  return {idx: best, off: bestD};
+}
+
+/* The line is a recorded trace, not lanes. A turn is a bend in that line. */
+function maneuver(idx){
+  const here = route.cum[idx];
+  const left = Math.max(0, route.total - here);
+  const base = route.bear[idx] ?? route.bear[Math.max(0, idx - 1)] ?? 0;
+  for (let k = idx; k < route.bear.length; k++){
+    const along = route.cum[k] - here;
+    if (along < 25) continue;
+    if (along > 450) break;
+    const delta = turnDelta(base, route.bear[k]);
+    const abs = Math.abs(delta);
+    if (abs < 28) continue;
+    const dir = delta > 0 ? "RIGHT" : "LEFT";
+    const kind = abs >= 55 ? "TURN" : "KEEP";
+    return {text: kind + " " + dir, along, left, done: here};
+  }
+  return {text: left < 40 ? "ARRIVED" : "CONTINUE", along: left, left, done: here};
+}
+
+function fmtDist(m){
+  if (m == null || !isFinite(m)) return "—";
+  return m >= 1000 ? (m / 1000).toFixed(1) + " km" : Math.round(m) + " m";
+}
+function fmtTime(s){
+  s = Math.max(0, Math.round(s));
+  const m = Math.floor(s / 60), h = Math.floor(m / 60);
+  const mm = String(m % 60).padStart(2, "0"), ss = String(s % 60).padStart(2, "0");
+  return h ? h + ":" + mm + ":" + ss : mm + ":" + ss;
+}
+
+function zoomFor(kmh){
+  if (kmh < 25) return 17.4;
+  if (kmh < 55) return 16.6;
+  return 15.8;
+}
+
+function frame(lat, lng){
+  if (!driving || userMoved || !map.isStyleLoaded()) return;
+  const headingUp = orient === "HEADING" && heading != null;
+  map.easeTo({
+    center: [lng, lat],
+    bearing: headingUp ? heading : 0,
+    pitch: headingUp ? 62 : 45,
+    zoom: zoomFor(speedKmh),
+    padding: {top: 210, bottom: 36, left: 12, right: 12},
+    duration: 700,
+    essential: true
+  });
+}
+
+function onFix(pos){
+  const lat = pos.coords.latitude, lng = pos.coords.longitude;
+  const acc = pos.coords.accuracy;
+  $("gps").className = acc > 35 ? "bad" : "ok";
+  $("gps").lastChild.textContent = " GPS";
+  if (lastFix){
+    const dt = (pos.timestamp - lastFix.t) / 1000;
+    if (dt > 0.4){
+      const mkh = haversine(lastFix.lat, lastFix.lng, lat, lng) / dt * 3.6;
+      if (pos.coords.speed == null || !isFinite(pos.coords.speed)) speedKmh = mkh;
+      if (mkh > 3) heading = bearing(lastFix.lat, lastFix.lng, lat, lng);
+    }
+  }
+  if (pos.coords.speed != null && isFinite(pos.coords.speed)) speedKmh = Math.max(0, pos.coords.speed * 3.6);
+  if (pos.coords.heading != null && isFinite(pos.coords.heading) && speedKmh > 4) heading = pos.coords.heading;
+  lastFix = {lat, lng, t: pos.timestamp};
+  marker.setLngLat([lng, lat]);
+  $("spd").textContent = String(Math.round(speedKmh));
+  if (recording){
+    recPts.push({lat, lng, t: new Date(pos.timestamp).toISOString()});
+    setLine("rec", recPts);
+  }
+  if (route){
+    const {idx, off} = nearestIndex(lat, lng);
+    const m = maneuver(idx);
+    $("dist").textContent = fmtDist(m.along);
+    $("act").textContent = off > 60 ? "OFF THE ROUTE" : m.text;
+    $("road").textContent = route.name || "";
+    $("left").textContent = fmtDist(m.left);
+    const pace = Math.max(speedKmh, 18);
+    $("eta").textContent = fmtTime(m.left / (pace / 3.6));
+    $("fill").style.width = (route.total ? Math.min(100, m.done / route.total * 100) : 0).toFixed(1) + "%";
+  } else if (driving){
+    $("dist").textContent = fmtDist(speedKmh < 2 ? 0 : null);
+    $("act").textContent = "FREE DRIVE";
+    $("road").textContent = "No route loaded";
+    $("left").textContent = "—";
+    $("eta").textContent = "—";
+  }
+  frame(lat, lng);
+  try { localStorage.setItem("gpx3d.view", JSON.stringify({lat, lng})); } catch (e) {}
+}
+
+function setDriving(on){
+  driving = on;
+  userMoved = false;
+  $("maneuver").style.display = on ? "block" : "none";
+  $("speed").style.display = on ? "flex" : "none";
+  $("orient").style.display = on ? "inline-block" : "none";
+  $("hint").style.display = on ? "none" : "block";
+  $("btn-go").textContent = on ? "STOP" : (route ? "START" : "DRIVE");
+  $("btn-go").className = on ? "stop" : "go";
+  if (on && lastFix) frame(lastFix.lat, lastFix.lng);
+}
+
+function startWatch(){
+  if (watchId != null || !navigator.geolocation) return;
+  watchId = navigator.geolocation.watchPosition(onFix, () => {
+    $("gps").className = "bad";
+  }, {enableHighAccuracy: true, maximumAge: 1000, timeout: 12000});
+}
+
+function loadPts(pts, name){
+  if (!pts || pts.length < 2){ alert("That GPX has no track."); return; }
+  route = buildRoute(pts);
+  route.name = name || "Route";
+  setLine("route", pts);
+  const b = pts.reduce((a, p) => {
+    a[0] = Math.min(a[0], p.lng); a[1] = Math.min(a[1], p.lat);
+    a[2] = Math.max(a[2], p.lng); a[3] = Math.max(a[3], p.lat);
+    return a;
+  }, [Infinity, Infinity, -Infinity, -Infinity]);
+  map.fitBounds([[b[0], b[1]], [b[2], b[3]]], {padding: 48, pitch: 50, duration: 800});
+  $("hint").textContent = route.name + " · " + fmtDist(route.total) + ". Press Start.";
+  if (!driving) $("btn-go").textContent = "START";
+}
+
+function parseGpx(text){
+  const xml = new DOMParser().parseFromString(text, "text/xml");
+  const nodes = xml.querySelectorAll("trkpt, rtept");
+  return [...nodes].map(n => ({lat: +n.getAttribute("lat"), lng: +n.getAttribute("lon")}))
+    .filter(p => isFinite(p.lat) && isFinite(p.lng));
+}
+
+function savedRoutes(){
+  try { return JSON.parse(localStorage.getItem("gpx3d.routes") || "[]"); } catch (e) { return []; }
+}
+function storeRoutes(list){
+  localStorage.setItem("gpx3d.routes", JSON.stringify(list.slice(0, 20)));
+}
+function renderSaved(){
+  const list = savedRoutes();
+  $("saved").innerHTML = list.length ? "" : "<li>Nothing saved on this phone yet.</li>";
+  list.forEach((r, i) => {
+    const li = document.createElement("li");
+    const name = document.createElement("span");
+    name.textContent = r.name;
+    const b = document.createElement("button");
+    b.type = "button";
+    b.textContent = "USE";
+    b.onclick = () => { loadPts(r.pts, r.name); $("sheet").style.display = "none"; };
+    li.append(name, b);
+    $("saved").append(li);
+  });
+}
+
+function toGpx(pts, name){
+  const body = pts.map(p => `<trkpt lat="${p.lat}" lon="${p.lng}"><time>${p.t || ""}</time></trkpt>`).join("");
+  return `<?xml version="1.0" encoding="UTF-8"?>\n<gpx version="1.1" creator="GPX Navigator 3D"><trk><name>${name}</name><trkseg>${body}</trkseg></trk></gpx>`;
+}
+
+function finishRec(){
+  recording = false;
+  $("btn-rec").classList.remove("on");
+  $("btn-rec").textContent = "RECORD";
+  if (recPts.length < 2){ recPts = []; return; }
+  const name = "Rec " + new Date().toISOString().slice(0, 16).replace("T", " ");
+  const list = savedRoutes();
+  list.unshift({name, pts: recPts.map(p => ({lat: p.lat, lng: p.lng})), at: Date.now()});
+  storeRoutes(list);
+  const blob = new Blob([toGpx(recPts, name)], {type: "application/gpx+xml"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = name.replace(/\s/g, "-") + ".gpx";
+  a.click();
+  loadPts(recPts, name);
+  recPts = [];
+}
+
+const savedView = (() => { try { return JSON.parse(localStorage.getItem("gpx3d.view") || "null"); } catch (e) { return null; } })();
+map = new maplibregl.Map({
+  container: "map",
+  style: STYLE,
+  center: savedView ? [savedView.lng, savedView.lat] : [11.97, 57.71],
+  zoom: savedView ? 16 : 14,
+  pitch: 58,
+  bearing: 0,
+  attributionControl: true
+});
+map.addControl(new maplibregl.NavigationControl({visualizePitch: true}), "bottom-left");
+map.on("load", () => {
+  map.addSource("route", {type: "geojson", data: empty});
+  map.addSource("rec", {type: "geojson", data: empty});
+  map.addLayer({id: "route", type: "line", source: "route", paint: {"line-color": "#ff6a00", "line-width": 6}});
+  map.addLayer({id: "rec", type: "line", source: "rec", paint: {"line-color": "#00b0ff", "line-width": 4}});
+  if (route) setLine("route", route.pts);
+});
+const veh = document.createElement("div");
+veh.className = "veh";
+marker = new maplibregl.Marker({element: veh, anchor: "center"})
+  .setLngLat(savedView ? [savedView.lng, savedView.lat] : [11.97, 57.71])
+  .addTo(map);
+map.on("dragstart", () => { if (driving) userMoved = true; });
+
+$("btn-go").onclick = () => {
+  if (driving){ setDriving(false); return; }
+  startWatch();
+  setDriving(true);
+};
+$("btn-load").onclick = () => $("file").click();
+$("file").onchange = () => {
+  const f = $("file").files[0];
+  if (!f) return;
+  const reader = new FileReader();
+  reader.onload = () => loadPts(parseGpx(reader.result), f.name.replace(/\.gpx$/i, ""));
+  reader.readAsText(f);
+  $("file").value = "";
+};
+$("btn-rec").onclick = () => {
+  if (recording){ finishRec(); return; }
+  recording = true;
+  recPts = [];
+  startWatch();
+  $("btn-rec").classList.add("on");
+  $("btn-rec").textContent = "SAVE";
+  if (!driving) setDriving(true);
+};
+$("btn-routes").onclick = () => {
+  const open = $("sheet").style.display === "block";
+  $("sheet").style.display = open ? "none" : "block";
+  if (!open) renderSaved();
+};
+$("orient").onclick = () => {
+  orient = orient === "HEADING" ? "NORTH" : "HEADING";
+  $("orient").textContent = orient === "HEADING" ? "HEADING UP" : "NORTH UP";
+  userMoved = false;
+  if (lastFix) frame(lastFix.lat, lastFix.lng);
+};
+
+if ("serviceWorker" in navigator){
+  try {
+    const p = navigator.serviceWorker.register("./sw.js", {updateViaCache: "none"});
+    if (p && typeof p.then === "function") p.then(r => { try { r && r.update && r.update(); } catch (e) {} }).catch(() => {});
+  } catch (e) {}
+}
+</script>
+</body>
+</html>

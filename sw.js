@@ -1,6 +1,6 @@
 // GPX Navigator Pro — Service Worker
 // Versão do cache: incrementar ao atualizar os arquivos
-const CACHE = "gpx-nav-v78-follow";
+const CACHE = "gpx-nav-v79-cockpit";
 const ASSETS = [
   "./",
   "./index.html",
